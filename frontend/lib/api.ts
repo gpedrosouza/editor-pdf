@@ -1,26 +1,40 @@
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:3001";
 
-// ── Types ──────────────────────────────────────────────────────────────────────
-
 export interface BgColor {
-  r: number; g: number; b: number; // 0–1 range
+  r: number;
+  g: number;
+  b: number;
+}
+
+export type TextAlign = "left" | "right";
+
+export interface Underline {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  color?: BgColor;
 }
 
 export interface TextItem {
   text: string;
-  x: number;       // PDF space (bottom-left origin)
-  y: number;       // PDF space (bottom-left origin, baseline)
-  w: number;       // bounding box width in points
-  h: number;       // bounding box height in points
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  boxY?: number;
+  boxH?: number;
   fontSize: number;
   fontName: string;
+  textAlign?: TextAlign;
   bgColor?: BgColor;
+  underline?: Underline;
 }
 
 export interface PageData {
-  pageIndex: number;   // 0-based
-  width: number;       // page width in points
-  height: number;      // page height in points
+  pageIndex: number;
+  width: number;
+  height: number;
   items: TextItem[];
 }
 
@@ -34,11 +48,15 @@ export interface Edit {
   y: number;
   w: number;
   h: number;
+  boxY?: number;
+  boxH?: number;
   fontSize: number;
   fontName: string;
   originalText: string;
   newText: string;
+  textAlign?: TextAlign;
   bgColor?: BgColor;
+  underline?: Underline;
 }
 
 export class ApiError extends Error {
@@ -47,8 +65,6 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
-
-// ── API calls ──────────────────────────────────────────────────────────────────
 
 export async function extractText(pdfBase64: string): Promise<ExtractResponse> {
   const res = await fetch(`${BACKEND}/extract-text`, {

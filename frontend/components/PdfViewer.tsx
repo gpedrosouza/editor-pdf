@@ -147,9 +147,11 @@ function TextOverlay({ items, pageIndex, pageHeightPt, scale, selectedItems, onT
         const isSelected = selectedItems.some((e) => editKey(e) === key);
 
         const cssX = item.x * scale;
-        const cssY = (pageHeightPt - item.y - item.h) * scale;
+        const itemBoxY = item.boxY ?? item.y;
+        const itemBoxH = item.boxH ?? item.h;
+        const cssY = (pageHeightPt - itemBoxY - itemBoxH) * scale;
         const cssW = item.w * scale;
-        const cssH = item.h * scale;
+        const cssH = itemBoxH * scale;
 
         return (
           <OverlayItem
@@ -166,11 +168,15 @@ function TextOverlay({ items, pageIndex, pageHeightPt, scale, selectedItems, onT
                 y: item.y,
                 w: item.w,
                 h: item.h,
+                boxY: item.boxY,
+                boxH: item.boxH,
                 fontSize: item.fontSize,
                 fontName: item.fontName,
                 originalText: item.text,
                 newText: item.text,
+                textAlign: item.textAlign,
                 bgColor: item.bgColor,
+                underline: item.underline,
               });
             }}
           />
