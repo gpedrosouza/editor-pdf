@@ -176,6 +176,7 @@ function TextOverlay({ items, pageIndex, pageHeightPt, scale, selectedItems, onT
                 newText: item.text,
                 textAlign: item.textAlign,
                 bgColor: item.bgColor,
+                bgRect: item.bgRect,
                 underline: item.underline,
               });
             }}

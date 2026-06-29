@@ -1,6 +1,7 @@
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
-const COVER_MARGIN = 1.2;
+const COVER_MARGIN = 1;
+const BACKGROUND_EDGE_INSET = 0.5;
 
 export async function applyEdits(pdfBuffer, edits) {
   const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
@@ -69,41 +70,34 @@ function getDrawX(edit, font, text) {
 }
 
 function getCoverBounds(edit) {
-  const textBox = getTextBox(edit);
-  const boxes = [textBox];
+  const bg = edit.bgRect;
 
-  if (isValidBox(edit.underline)) {
-    boxes.push({
-      x: edit.underline.x,
-      y: edit.underline.y,
-      width: edit.underline.w,
-      height: edit.underline.h,
-    });
+  if (isValidBox(bg)) {
+    // Draw inside the detected stripe. PDF row backgrounds often include
+    // anti-aliased edge pixels; repainting those edges locally makes a pasted box visible.
+    const verticalInset = Math.min(BACKGROUND_EDGE_INSET, bg.h / 4);
+    const left = Math.max(edit.x - COVER_MARGIN, bg.x);
+    const right = Math.min(edit.x + edit.w + COVER_MARGIN, bg.x + bg.w);
+
+    return {
+      x: left,
+      y: bg.y + verticalInset,
+      width: Math.max(right - left, 0.1),
+      height: Math.max(bg.h - verticalInset * 2, 0.1),
+    };
   }
 
-  const left = Math.min(...boxes.map((box) => box.x));
-  const bottom = Math.min(...boxes.map((box) => box.y));
-  const right = Math.max(...boxes.map((box) => box.x + box.width));
-  const top = Math.max(...boxes.map((box) => box.y + box.height));
-
+  // Fallback for items with no detected background.
+  let top = edit.y + edit.h + COVER_MARGIN;
+  let bottom = edit.y - COVER_MARGIN;
+  if (isValidBox(edit.underline) && edit.underline.y < bottom) {
+    bottom = edit.underline.y - 0.1;
+  }
   return {
-    x: left - COVER_MARGIN,
-    y: bottom - COVER_MARGIN,
-    width: right - left + COVER_MARGIN * 2,
-    height: top - bottom + COVER_MARGIN * 2,
-  };
-}
-
-function getTextBox(edit) {
-  const descent = Math.max(edit.fontSize * 0.25, 1);
-  const boxY = finiteOr(edit.boxY, edit.y - descent);
-  const boxH = finiteOr(edit.boxH, edit.h + descent);
-
-  return {
-    x: edit.x,
-    y: boxY,
-    width: edit.w,
-    height: boxH,
+    x: edit.x - COVER_MARGIN,
+    y: bottom,
+    width: edit.w + COVER_MARGIN * 2,
+    height: Math.max(top - bottom, 0.1),
   };
 }
 
@@ -146,10 +140,6 @@ function isValidBox(box) {
     Number.isFinite(box.h) &&
     box.w > 0 &&
     box.h > 0;
-}
-
-function finiteOr(value, fallback) {
-  return Number.isFinite(value) ? value : fallback;
 }
 
 function toPdfColor(color, fallback) {

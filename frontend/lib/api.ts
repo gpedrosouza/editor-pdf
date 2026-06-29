@@ -16,6 +16,13 @@ export interface Underline {
   color?: BgColor;
 }
 
+export interface BgRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface TextItem {
   text: string;
   x: number;
@@ -28,6 +35,7 @@ export interface TextItem {
   fontName: string;
   textAlign?: TextAlign;
   bgColor?: BgColor;
+  bgRect?: BgRect;
   underline?: Underline;
 }
 
@@ -56,6 +64,7 @@ export interface Edit {
   newText: string;
   textAlign?: TextAlign;
   bgColor?: BgColor;
+  bgRect?: BgRect;
   underline?: Underline;
 }
 
