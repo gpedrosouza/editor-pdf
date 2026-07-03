@@ -9,6 +9,8 @@ frontend/tsconfig.tsbuildinfo
 # Build outputs
 dist/
 build/
+__pycache__/
+**/__pycache__/
 
 # Environment variables
 .env

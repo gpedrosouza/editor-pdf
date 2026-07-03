@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { ExtractResponse, Edit, editPdf, ApiError } from "@/lib/api";
+import { ExtractResponse, Edit, TextAlign, editPdf, ApiError } from "@/lib/api";
+import { exportToExcel, importFromExcel } from "@/lib/excel";
 import { useWindowWidth } from "@/hooks/useWindowWidth";
 import dynamic from "next/dynamic";
 import Topbar from "@/components/Topbar";
@@ -49,6 +50,7 @@ export default function Home() {
   const [editedPdfBase64, setEditedPdfBase64] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastMsg[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const excelInputRef = useRef<HTMLInputElement>(null);
 
   // Auto-open the mobile drawer when the first item is selected
   const prevCountRef = useRef(0);
@@ -109,6 +111,44 @@ export default function Home() {
     setSelectedItems([]);
   }
 
+  function handleSetTextAlign(align: TextAlign) {
+    setSelectedItems((prev) => prev.map((edit) => ({ ...edit, textAlign: align })));
+    setEditedPdfBase64(null);
+  }
+
+  function handleExportExcel() {
+    if (!loaded) return;
+
+    const count = exportToExcel(loaded.data.pages, loaded.filename);
+    showToast(
+      count > 0
+        ? `Planilha exportada com ${count} valores.`
+        : "Nenhum valor editável encontrado para exportar.",
+      count > 0 ? "success" : "info"
+    );
+  }
+
+  function handleChooseExcel() {
+    excelInputRef.current?.click();
+  }
+
+  async function handleImportExcelFile(file: File) {
+    try {
+      const edits = await importFromExcel(file);
+      if (edits.length === 0) {
+        showToast("Nenhum valor novo preenchido na planilha.", "info");
+        return;
+      }
+
+      setSelectedItems(edits);
+      setEditedPdfBase64(null);
+      if (isMobile) setDrawerOpen(true);
+      showToast(`${edits.length} edições importadas da planilha.`, "success");
+    } catch {
+      showToast("Não foi possível importar a planilha.", "error");
+    }
+  }
+
   async function handleApply() {
     if (!loaded || isApplying || selectedItems.length === 0) return;
     setIsApplying(true);
@@ -144,6 +184,7 @@ export default function Home() {
     onRemove: handleRemove,
     onChangeNewText: handleChangeNewText,
     onClearAll: handleClearAll,
+    onSetTextAlign: handleSetTextAlign,
     onApply: handleApply,
     isLoading: isApplying,
   };
@@ -171,7 +212,21 @@ export default function Home() {
         filename={loaded.filename}
         showActions
         onNewPdf={handleNewPdf}
+        onExportExcel={handleExportExcel}
+        onImportExcel={handleChooseExcel}
         onDownload={editedPdfBase64 ? handleDownload : undefined}
+      />
+
+      <input
+        ref={excelInputRef}
+        type="file"
+        accept=".xlsx,.xls"
+        style={{ display: "none" }}
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (file) void handleImportExcelFile(file);
+        }}
       />
 
       <main

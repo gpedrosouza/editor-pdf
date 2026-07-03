@@ -32,6 +32,8 @@ const DEFAULT_STROKE = { r: 0, g: 0, b: 0 };
 const IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
 const DEFAULT_ASCENT = 0.8;
 const DEFAULT_DESCENT = -0.2;
+const SUBSET_PREFIX_PATTERN = /^[A-Z]{6}\+/;
+const BOLD_FONT_PATTERN = /\b(bold|black|heavy|semibold|demi)\b/i;
 
 function cloneColor(color) {
   return color ? { r: color.r, g: color.g, b: color.b } : null;
@@ -428,7 +430,7 @@ function findUnderline(item, horizontalRules) {
 
 function looksLikeNumericValue(text) {
   const value = text.trim().replace(/\s+/g, '');
-  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?\)?$/.test(value);
+  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?[DC]?\)?$/i.test(value);
 }
 
 function getTextBox(item, style, fontSize) {
@@ -440,6 +442,42 @@ function getTextBox(item, style, fontSize) {
   const boxH = Math.max(fontSize * (ascent - descent), item.height || fontSize);
 
   return { boxY, boxH, ascent, descent };
+}
+
+function getFontMetadata(page, fontName, style) {
+  let pdfFont = null;
+  try {
+    pdfFont = page.commonObjs?.get(fontName);
+  } catch {
+    pdfFont = null;
+  }
+
+  const rawFontName = normalizeFontName(pdfFont?.name || '');
+  const styleFamily = typeof style?.fontFamily === 'string' ? style.fontFamily : '';
+  const fontFamily = getFontFamily(rawFontName) || styleFamily || '';
+  const weightSource = [rawFontName, styleFamily, fontName].filter(Boolean).join(' ');
+
+  return {
+    fontFamily,
+    fontWeight: isBoldFontName(weightSource) ? 'bold' : 'normal',
+  };
+}
+
+function normalizeFontName(name) {
+  return String(name || '').replace(SUBSET_PREFIX_PATTERN, '');
+}
+
+function getFontFamily(name) {
+  const normalized = normalizeFontName(name);
+  if (!normalized) return '';
+  return normalized
+    .split(',')[0]
+    .replace(/[-\s]?(bold|black|heavy|semibold|demi|regular|italic|oblique|mt)$/ig, '')
+    .trim();
+}
+
+function isBoldFontName(name) {
+  return BOLD_FONT_PATTERN.test(String(name || '').replace(/[-_,]/g, ' '));
 }
 
 export async function extractTextFromBuffer(pdfBuffer) {
@@ -477,6 +515,7 @@ export async function extractTextFromBuffer(pdfBuffer) {
       const h = item.height || fontSize;
       const style = textContent.styles?.[item.fontName] || {};
       const textBox = getTextBox(item, style, fontSize);
+      const fontMetadata = getFontMetadata(page, item.fontName, style);
 
       const partial = {
         text: item.str,
@@ -487,6 +526,7 @@ export async function extractTextFromBuffer(pdfBuffer) {
         ...textBox,
         fontSize,
         fontName: item.fontName || 'unknown',
+        ...fontMetadata,
         textAlign: looksLikeNumericValue(item.str) ? 'right' : 'left',
       };
       const bgResult = findBgColor(partial, coloredRects);

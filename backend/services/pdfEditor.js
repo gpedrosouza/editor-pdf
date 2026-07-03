@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import fontkit from '@pdf-lib/fontkit';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
 const COVER_MARGIN = 1;
@@ -5,21 +8,19 @@ const BACKGROUND_EDGE_INSET = 0.5;
 
 export async function applyEdits(pdfBuffer, edits) {
   const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+  doc.registerFontkit(fontkit);
   const pages = doc.getPages();
-
-  const helvetica = await doc.embedFont(StandardFonts.Helvetica);
-  const timesRoman = await doc.embedFont(StandardFonts.TimesRoman);
-  const courier = await doc.embedFont(StandardFonts.Courier);
+  const fonts = await loadFonts(doc);
 
   for (const edit of edits) {
-    const { pageIndex, y, fontSize, fontName, newText, bgColor } = edit;
+    const { pageIndex, y, fontSize, newText, bgColor } = edit;
 
     if (pageIndex < 0 || pageIndex >= pages.length) {
       throw new EditError(`pageIndex ${pageIndex} is out of range (document has ${pages.length} page(s))`);
     }
 
     const page = pages[pageIndex];
-    const font = pickFont(fontName, { helvetica, timesRoman, courier });
+    const font = pickFont(edit, fonts);
     const text = newText ?? '';
     const textWidth = font.widthOfTextAtSize(text, fontSize);
     const drawX = getDrawX(edit, font, text);
@@ -61,6 +62,65 @@ export async function applyEdits(pdfBuffer, edits) {
   return doc.save();
 }
 
+async function loadFonts(doc) {
+  const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+  const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const timesRoman = await doc.embedFont(StandardFonts.TimesRoman);
+  const timesRomanBold = await doc.embedFont(StandardFonts.TimesRomanBold);
+  const courier = await doc.embedFont(StandardFonts.Courier);
+  const courierBold = await doc.embedFont(StandardFonts.CourierBold);
+
+  const tahoma = await embedFontFile(doc, findSystemFontPath([
+    'tahoma.ttf',
+    'Tahoma.ttf',
+    'DejaVuSans.ttf',
+    'Arial.ttf',
+    'LiberationSans-Regular.ttf',
+  ]));
+  const tahomaBold = await embedFontFile(doc, findSystemFontPath([
+    'tahomabd.ttf',
+    'Tahoma Bold.ttf',
+    'DejaVuSans-Bold.ttf',
+    'Arial Bold.ttf',
+    'LiberationSans-Bold.ttf',
+  ]));
+
+  return {
+    sans: tahoma || helvetica,
+    sansBold: tahomaBold || tahoma || helveticaBold,
+    timesRoman,
+    timesRomanBold,
+    courier,
+    courierBold,
+  };
+}
+
+async function embedFontFile(doc, filePath) {
+  if (!filePath) return null;
+  return doc.embedFont(readFileSync(filePath), { subset: true });
+}
+
+function findSystemFontPath(fileNames) {
+  const fontDirs = [
+    process.env.WINDIR ? join(process.env.WINDIR, 'Fonts') : null,
+    '/Library/Fonts',
+    '/System/Library/Fonts',
+    '/System/Library/Fonts/Supplemental',
+    '/usr/share/fonts/truetype/dejavu',
+    '/usr/share/fonts/truetype/liberation2',
+    '/usr/share/fonts/truetype/msttcorefonts',
+  ].filter(Boolean);
+
+  for (const dir of fontDirs) {
+    for (const fileName of fileNames) {
+      const candidate = join(dir, fileName);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  return null;
+}
+
 function getDrawX(edit, font, text) {
   const textWidth = font.widthOfTextAtSize(text ?? '', edit.fontSize);
   if (resolveTextAlign(edit) === 'right') {
@@ -88,8 +148,9 @@ function getCoverBounds(edit) {
   }
 
   // Fallback for items with no detected background.
-  let top = edit.y + edit.h + COVER_MARGIN;
-  let bottom = edit.y - COVER_MARGIN;
+  const textBox = getTextBox(edit);
+  let top = textBox.y + textBox.height + COVER_MARGIN;
+  let bottom = textBox.y - COVER_MARGIN;
   if (isValidBox(edit.underline) && edit.underline.y < bottom) {
     bottom = edit.underline.y - 0.1;
   }
@@ -98,6 +159,16 @@ function getCoverBounds(edit) {
     y: bottom,
     width: edit.w + COVER_MARGIN * 2,
     height: Math.max(top - bottom, 0.1),
+  };
+}
+
+function getTextBox(edit) {
+  const descent = Math.max(edit.fontSize * 0.25, 1);
+  return {
+    x: edit.x,
+    y: finiteOr(edit.boxY, edit.y - descent),
+    width: edit.w,
+    height: finiteOr(edit.boxH, edit.h + descent),
   };
 }
 
@@ -129,7 +200,7 @@ function resolveTextAlign(edit) {
 function looksLikeNumericValue(text) {
   if (typeof text !== 'string') return false;
   const value = text.trim().replace(/\s+/g, '');
-  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?\)?$/.test(value);
+  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?[DC]?\)?$/i.test(value);
 }
 
 function isValidBox(box) {
@@ -140,6 +211,10 @@ function isValidBox(box) {
     Number.isFinite(box.h) &&
     box.w > 0 &&
     box.h > 0;
+}
+
+function finiteOr(value, fallback) {
+  return Number.isFinite(value) ? value : fallback;
 }
 
 function toPdfColor(color, fallback) {
@@ -155,15 +230,35 @@ function clamp01(value) {
   return Math.min(1, Math.max(0, value));
 }
 
-function pickFont(fontName, { helvetica, timesRoman, courier }) {
-  const name = (fontName || '').toLowerCase();
-  if (name.includes('times') || name.includes('roman') || name.includes('serif')) {
-    return timesRoman;
+function pickFont(edit, fonts) {
+  const family = String(edit.fontFamily || edit.fontName || '').toLowerCase();
+  const bold = isBoldFont(edit);
+
+  if (family.includes('courier') || family.includes('mono') || family.includes('typewriter')) {
+    return bold ? fonts.courierBold : fonts.courier;
   }
-  if (name.includes('courier') || name.includes('mono') || name.includes('typewriter')) {
-    return courier;
+
+  if (family.includes('times') || family.includes('roman') || (family.includes('serif') && !family.includes('sans-serif'))) {
+    return bold ? fonts.timesRomanBold : fonts.timesRoman;
   }
-  return helvetica;
+
+  return bold ? fonts.sansBold : fonts.sans;
+}
+
+function isBoldFont(edit) {
+  const weight = edit.fontWeight;
+  if (typeof weight === 'number') return weight >= 600;
+  if (typeof weight === 'string' && Number.isFinite(Number(weight))) {
+    return Number(weight) >= 600;
+  }
+
+  const source = [
+    weight,
+    edit.fontFamily,
+    edit.fontName,
+  ].filter(Boolean).join(' ');
+
+  return /\b(bold|black|heavy|semibold|demi)\b/i.test(source.replace(/[-_,]/g, ' '));
 }
 
 export class EditError extends Error {

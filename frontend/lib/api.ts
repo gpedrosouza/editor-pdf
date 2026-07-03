@@ -7,6 +7,7 @@ export interface BgColor {
 }
 
 export type TextAlign = "left" | "right";
+export type FontWeight = "normal" | "bold";
 
 export interface Underline {
   x: number;
@@ -33,6 +34,8 @@ export interface TextItem {
   boxH?: number;
   fontSize: number;
   fontName: string;
+  fontFamily?: string;
+  fontWeight?: FontWeight;
   textAlign?: TextAlign;
   bgColor?: BgColor;
   bgRect?: BgRect;
@@ -60,6 +63,8 @@ export interface Edit {
   boxH?: number;
   fontSize: number;
   fontName: string;
+  fontFamily?: string;
+  fontWeight?: FontWeight;
   originalText: string;
   newText: string;
   textAlign?: TextAlign;
