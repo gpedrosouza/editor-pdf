@@ -172,10 +172,13 @@ function TextOverlay({ items, pageIndex, pageHeightPt, scale, selectedItems, onT
                 boxH: item.boxH,
                 fontSize: item.fontSize,
                 fontName: item.fontName,
+                fontFamily: item.fontFamily,
+                fontWeight: item.fontWeight,
                 originalText: item.text,
                 newText: item.text,
                 textAlign: item.textAlign,
                 bgColor: item.bgColor,
+                bgRect: item.bgRect,
                 underline: item.underline,
               });
             }}

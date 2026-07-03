@@ -32,6 +32,8 @@ const DEFAULT_STROKE = { r: 0, g: 0, b: 0 };
 const IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
 const DEFAULT_ASCENT = 0.8;
 const DEFAULT_DESCENT = -0.2;
+const SUBSET_PREFIX_PATTERN = /^[A-Z]{6}\+/;
+const BOLD_FONT_PATTERN = /\b(bold|black|heavy|semibold|demi)\b/i;
 
 function cloneColor(color) {
   return color ? { r: color.r, g: color.g, b: color.b } : null;
@@ -362,17 +364,23 @@ function findBgColor(item, coloredRects) {
   const boxH = Number.isFinite(item.boxH) ? item.boxH : item.h;
   const cx = item.x + item.w / 2;
   const cy = boxY + boxH / 2;
-  let last = null;
+  // Minimum height to be a plausible row background (not an underline stroke).
+  const minH = Math.max(item.fontSize || item.h || 10, 2) * 0.5;
+  let best = null;
 
   for (const rect of coloredRects) {
-    if (cx >= rect.x && cx <= rect.x + rect.w &&
-        cy >= rect.y && cy <= rect.y + rect.h) {
-      last = rect.color;
+    if (rect.h < minH) continue; // skip thin rules
+    if (cx < rect.x || cx > rect.x + rect.w) continue;
+    if (cy < rect.y || cy > rect.y + rect.h) continue;
+    // Prefer the smallest-height rect: the most specific background for this row.
+    // A full-page or multi-row background will always have larger h than the faixa.
+    if (!best || rect.h < best.h) {
+      best = rect;
     }
   }
 
-  if (last && last.r > 0.99 && last.g > 0.99 && last.b > 0.99) return null;
-  return last;
+  if (!best || (best.color.r > 0.99 && best.color.g > 0.99 && best.color.b > 0.99)) return null;
+  return best;
 }
 
 function overlapLength(aStart, aEnd, bStart, bEnd) {
@@ -422,7 +430,7 @@ function findUnderline(item, horizontalRules) {
 
 function looksLikeNumericValue(text) {
   const value = text.trim().replace(/\s+/g, '');
-  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?\)?$/.test(value);
+  return /^\(?[-+]?((R\$|\$|\u20AC|\u00A3)?\d{1,3}([.,]\d{3})*([.,]\d+)?|\d+([.,]\d+)?)%?[DC]?\)?$/i.test(value);
 }
 
 function getTextBox(item, style, fontSize) {
@@ -434,6 +442,42 @@ function getTextBox(item, style, fontSize) {
   const boxH = Math.max(fontSize * (ascent - descent), item.height || fontSize);
 
   return { boxY, boxH, ascent, descent };
+}
+
+function getFontMetadata(page, fontName, style) {
+  let pdfFont = null;
+  try {
+    pdfFont = page.commonObjs?.get(fontName);
+  } catch {
+    pdfFont = null;
+  }
+
+  const rawFontName = normalizeFontName(pdfFont?.name || '');
+  const styleFamily = typeof style?.fontFamily === 'string' ? style.fontFamily : '';
+  const fontFamily = getFontFamily(rawFontName) || styleFamily || '';
+  const weightSource = [rawFontName, styleFamily, fontName].filter(Boolean).join(' ');
+
+  return {
+    fontFamily,
+    fontWeight: isBoldFontName(weightSource) ? 'bold' : 'normal',
+  };
+}
+
+function normalizeFontName(name) {
+  return String(name || '').replace(SUBSET_PREFIX_PATTERN, '');
+}
+
+function getFontFamily(name) {
+  const normalized = normalizeFontName(name);
+  if (!normalized) return '';
+  return normalized
+    .split(',')[0]
+    .replace(/[-\s]?(bold|black|heavy|semibold|demi|regular|italic|oblique|mt)$/ig, '')
+    .trim();
+}
+
+function isBoldFontName(name) {
+  return BOLD_FONT_PATTERN.test(String(name || '').replace(/[-_,]/g, ' '));
 }
 
 export async function extractTextFromBuffer(pdfBuffer) {
@@ -471,6 +515,7 @@ export async function extractTextFromBuffer(pdfBuffer) {
       const h = item.height || fontSize;
       const style = textContent.styles?.[item.fontName] || {};
       const textBox = getTextBox(item, style, fontSize);
+      const fontMetadata = getFontMetadata(page, item.fontName, style);
 
       const partial = {
         text: item.str,
@@ -481,14 +526,18 @@ export async function extractTextFromBuffer(pdfBuffer) {
         ...textBox,
         fontSize,
         fontName: item.fontName || 'unknown',
+        ...fontMetadata,
         textAlign: looksLikeNumericValue(item.str) ? 'right' : 'left',
       };
-      const bgColor = findBgColor(partial, coloredRects);
+      const bgResult = findBgColor(partial, coloredRects);
       const underline = findUnderline(partial, horizontalRules);
 
       items.push({
         ...partial,
-        ...(bgColor ? { bgColor } : {}),
+        ...(bgResult ? {
+          bgColor: cloneColor(bgResult.color),
+          bgRect: { x: bgResult.x, y: bgResult.y, w: bgResult.w, h: bgResult.h },
+        } : {}),
         ...(underline ? { underline } : {}),
       });
     }

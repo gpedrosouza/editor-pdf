@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { Edit } from "@/lib/api";
+import { useState, type ReactNode } from "react";
+import { Edit, TextAlign } from "@/lib/api";
 
 interface Props {
   selectedItems: Edit[];
   onRemove: (edit: Edit) => void;
   onChangeNewText: (edit: Edit, newText: string) => void;
   onClearAll: () => void;
+  onSetTextAlign: (align: TextAlign) => void;
   onApply: () => void;
   isLoading?: boolean;
   variant?: "side" | "drawer";
@@ -21,6 +22,7 @@ export default function TextEditPanel({
   onRemove,
   onChangeNewText,
   onClearAll,
+  onSetTextAlign,
   onApply,
   isLoading = false,
   variant = "side",
@@ -33,7 +35,15 @@ export default function TextEditPanel({
   const applyEnabled = hasItems && !isLoading;
 
   const sharedBodyProps = { hasItems, selectedItems, onRemove, onChangeNewText };
-  const sharedFooterProps = { applyEnabled, hasItems, isLoading, onApply, onClearAll };
+  const sharedFooterProps = {
+    applyEnabled,
+    hasItems,
+    isLoading,
+    selectedItems,
+    onSetTextAlign,
+    onApply,
+    onClearAll,
+  };
 
   // ── Mobile drawer ────────────────────────────────────────────────────────────
   if (variant === "drawer") {
@@ -212,7 +222,7 @@ export default function TextEditPanel({
                 zIndex: 10,
               }}
             >
-              Fontes customizadas do PDF serão substituídas por Helvetica/Times no arquivo editado. O layout e posicionamento são preservados.
+              Fontes customizadas do PDF serao preservadas quando disponiveis; caso contrario, o app usa uma fonte compativel mantendo estilo e posicao.
               <span
                 style={{
                   position: "absolute",
@@ -302,11 +312,23 @@ interface FooterProps {
   applyEnabled: boolean;
   hasItems: boolean;
   isLoading: boolean;
+  selectedItems: Edit[];
+  onSetTextAlign: (align: TextAlign) => void;
   onApply: () => void;
   onClearAll: () => void;
 }
 
-function PanelFooter({ applyEnabled, hasItems, isLoading, onApply, onClearAll }: FooterProps) {
+function PanelFooter({
+  applyEnabled,
+  hasItems,
+  isLoading,
+  selectedItems,
+  onSetTextAlign,
+  onApply,
+  onClearAll,
+}: FooterProps) {
+  const activeAlign = getActiveAlign(selectedItems);
+
   return (
     <div
       style={{
@@ -318,6 +340,36 @@ function PanelFooter({ applyEnabled, hasItems, isLoading, onApply, onClearAll }:
         flexShrink: 0,
       }}
     >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <span style={{ fontSize: 11, color: "#6e7391", flex: 1 }}>
+          Alinhamento
+        </span>
+        <AlignButton
+          active={activeAlign === "left"}
+          disabled={!hasItems || isLoading}
+          onClick={() => onSetTextAlign("left")}
+          title="Alinhar a esquerda"
+        >
+          <AlignLeftIcon />
+          Esq.
+        </AlignButton>
+        <AlignButton
+          active={activeAlign === "right"}
+          disabled={!hasItems || isLoading}
+          onClick={() => onSetTextAlign("right")}
+          title="Alinhar a direita"
+        >
+          <AlignRightIcon />
+          Dir.
+        </AlignButton>
+      </div>
+
       <button
         onClick={applyEnabled ? onApply : undefined}
         disabled={!applyEnabled}
@@ -367,6 +419,53 @@ function PanelFooter({ applyEnabled, hasItems, isLoading, onApply, onClearAll }:
         Limpar seleção
       </button>
     </div>
+  );
+}
+
+function getActiveAlign(items: Edit[]): TextAlign | null {
+  if (items.length === 0) return null;
+  const first = items[0].textAlign;
+  if (first !== "left" && first !== "right") return null;
+  return items.every((item) => item.textAlign === first) ? first : null;
+}
+
+function AlignButton({
+  active,
+  disabled,
+  onClick,
+  title,
+  children,
+}: {
+  active: boolean;
+  disabled: boolean;
+  onClick: () => void;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      onClick={!disabled ? onClick : undefined}
+      disabled={disabled}
+      title={title}
+      style={{
+        height: 28,
+        minWidth: 58,
+        border: active ? "1px solid #6366F1" : "0.5px solid #2a2d3a",
+        borderRadius: 6,
+        background: active ? "rgba(99,102,241,0.16)" : "transparent",
+        color: active ? "#e2e4ef" : "#9ea3b8",
+        opacity: disabled ? 0.45 : 1,
+        cursor: disabled ? "not-allowed" : "pointer",
+        fontSize: 11,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 5,
+        padding: "0 8px",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -528,6 +627,46 @@ function WarnIcon() {
       <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
       <line x1="12" y1="9" x2="12" y2="13" />
       <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  );
+}
+
+function AlignLeftIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="4" y1="10" x2="14" y2="10" />
+      <line x1="4" y1="14" x2="18" y2="14" />
+      <line x1="4" y1="18" x2="12" y2="18" />
+    </svg>
+  );
+}
+
+function AlignRightIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="10" y1="10" x2="20" y2="10" />
+      <line x1="6" y1="14" x2="20" y2="14" />
+      <line x1="12" y1="18" x2="20" y2="18" />
     </svg>
   );
 }
