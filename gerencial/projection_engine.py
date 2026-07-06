@@ -151,7 +151,7 @@ BAL_DISPONIVEL_FIELDS = [
 
 BAL_CLIENTES_FIELDS = ["clientes"]
 
-BAL_OUTROS_CREDITOS_CMV_FIELDS = ["adiant_forn_1", "adiant_forn_2"]
+BAL_OUTROS_CREDITOS_CMV_FIELDS = ["adiant_forn_1"]
 BAL_OUTROS_CREDITOS_DESP_FIELDS = ["adiant_ferias"]
 BAL_OUTROS_CREDITOS_DED_FIELDS = ["ipi_rec", "icms_rec"]
 
@@ -216,7 +216,6 @@ BAL_PASSIVO_DESP_FIELDS = [
 
 BAL_PASSIVO_CIRC_MANTIDO_FIELDS = [
     "adiant_clientes",
-    "sorbell",
     "parc_cp_items",
 ]
 
@@ -359,17 +358,42 @@ def normalize_dre(raw: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def normalize_balanco(raw: Mapping[str, Any]) -> dict[str, float]:
-    out: dict[str, float] = {field: _number(raw.get(field, 0.0)) for field in BAL_VALUE_FIELDS}
+def normalize_balanco(raw: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {field: _number(raw.get(field, 0.0)) for field in BAL_VALUE_FIELDS}
 
     # The current extractor does not read a total fornecedores line; the
     # validated workbook uses this fixed value until the extraction is expanded.
     out["fornecedores_total"] = _number(raw.get("fornecedores_total", 1_408_890.43))
+
+    # Bancos parceiros are company-specific and can't be benchmarked or
+    # extracted generically, so they are entered by hand: a free-form list of
+    # {nome, valor} pairs. A bank can be listed with valor 0 when the name is
+    # known but the balance isn't.
+    out["bancos_parceiros"] = normalize_bancos_parceiros(raw.get("bancos_parceiros"))
     return out
+
+
+def normalize_bancos_parceiros(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    bancos = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        nome = str(entry.get("nome") or "").strip()
+        if not nome:
+            continue
+        bancos.append({"nome": nome, "valor": _number(entry.get("valor", 0.0))})
+    return bancos
+
+
+def sum_bancos_parceiros(bancos: Any) -> float:
+    return sum(_number(entry.get("valor", 0.0)) for entry in bancos) if isinstance(bancos, list) else 0.0
 
 
 def project_dre(original: Mapping[str, Any], params: ScenarioParams) -> dict[str, Any]:
     scenario = normalize_dre(original)
+    pinned_fields = _pinned_fields_from(original)
     original_rb = _sum(original, DRE_RECEITA_FIELDS)
     rb_target = params.receita_bruta_alvo if params.receita_bruta_alvo is not None else original_rb
     rb_factor = _safe_div(rb_target, original_rb, default=1.0)
@@ -389,14 +413,20 @@ def project_dre(original: Mapping[str, Any], params: ScenarioParams) -> dict[str
         scenario,
         params,
         rb_factor,
+        pinned_fields,
     )
 
     custos_target = _sum(original, DRE_CUSTO_FIELDS) * rb_factor * (1 - reducao_cmv)
-    for field, value in _allocate(original, DRE_CUSTO_FIELDS, custos_target, fallback="cmv").items():
+    for field, value in _allocate_with_pins(
+        original, DRE_CUSTO_FIELDS, custos_target, pinned_fields, fallback="cmv"
+    ).items():
         scenario[field] = value
 
     for field in DRE_DESPESA_OPERACIONAL_FIELDS + DRE_DESPESA_FINANCEIRA_FIELDS:
-        scenario[field] = _number(original.get(field, 0.0)) * (1 - reducao_despesas)
+        if field in pinned_fields:
+            scenario[field] = _number(original.get(field, 0.0))
+        else:
+            scenario[field] = _number(original.get(field, 0.0)) * (1 - reducao_despesas)
 
     before_tax = calculate_dre_totals({**scenario, "csll": 0.0, "irpj": 0.0})[
         "resultado_antes_ir_csl"
@@ -421,13 +451,26 @@ def resolve_reductions_for_target(
     scenario: Mapping[str, Any],
     params: ScenarioParams,
     rb_factor: float,
+    pinned_fields: frozenset[str] = frozenset(),
 ) -> tuple[float, float]:
     if abs(params.meta_lucro_pct) <= 1e-9:
         return params.reducao_cmv_pct, params.reducao_despesas_pct
 
+    pinned_custo_fields = [f for f in DRE_CUSTO_FIELDS if f in pinned_fields]
+    pinned_despesa_fields = [
+        f for f in DRE_DESPESA_OPERACIONAL_FIELDS + DRE_DESPESA_FINANCEIRA_FIELDS if f in pinned_fields
+    ]
+    # Manually pinned lines are kept at the user's exact value (see project_dre),
+    # so they're removed from the reducible base and from the amount the
+    # reduction still needs to close, letting the remaining fields absorb
+    # whatever the target net profit requires.
+    pinned_total = _sum(original, pinned_custo_fields) + _sum(original, pinned_despesa_fields)
+
     receita_bruta = _sum(scenario, DRE_RECEITA_FIELDS)
-    custos_base = _sum(original, DRE_CUSTO_FIELDS) * rb_factor
-    despesas_base = _sum(original, DRE_DESPESA_OPERACIONAL_FIELDS + DRE_DESPESA_FINANCEIRA_FIELDS)
+    custos_base = (_sum(original, DRE_CUSTO_FIELDS) - _sum(original, pinned_custo_fields)) * rb_factor
+    despesas_base = _sum(
+        original, DRE_DESPESA_OPERACIONAL_FIELDS + DRE_DESPESA_FINANCEIRA_FIELDS
+    ) - _sum(original, pinned_despesa_fields)
     controllable_base = custos_base + despesas_base
     if abs(receita_bruta) < 1e-9 or abs(controllable_base) < 1e-9:
         return params.reducao_cmv_pct, params.reducao_despesas_pct
@@ -444,7 +487,7 @@ def resolve_reductions_for_target(
         - _sum(scenario, DRE_DEDUCAO_FIELDS)
         + _sum(scenario, DRE_RECEITA_FINANCEIRA_FIELDS)
     )
-    required_control_total = result_before_controls - required_before_tax
+    required_control_total = result_before_controls - required_before_tax - pinned_total
     reduction = 1 - (required_control_total / controllable_base)
     return reduction, reduction
 
@@ -525,7 +568,8 @@ def project_balanco(
 
 
 def calculate_balanco_totals(values: Mapping[str, Any]) -> dict[str, float]:
-    disponivel = _sum(values, BAL_DISPONIVEL_FIELDS)
+    bancos_parceiros_total = sum_bancos_parceiros(values.get("bancos_parceiros"))
+    disponivel = _sum(values, BAL_DISPONIVEL_FIELDS) + bancos_parceiros_total
     clientes = _sum(values, BAL_CLIENTES_FIELDS)
     outros_creditos = _sum(
         values,
@@ -557,6 +601,7 @@ def calculate_balanco_totals(values: Mapping[str, Any]) -> dict[str, float]:
 
     return {
         "disponivel": disponivel,
+        "bancos_parceiros_total": bancos_parceiros_total,
         "clientes": clientes,
         "outros_creditos": outros_creditos,
         "estoque": estoque,
@@ -643,6 +688,30 @@ def _allocate(
     for field in fields:
         allocated[field] = _number(values.get(field, 0.0)) / base * target
     return allocated
+
+
+def _allocate_with_pins(
+    values: Mapping[str, Any],
+    fields: list[str],
+    target: float,
+    pinned_fields: frozenset[str],
+    *,
+    fallback: str,
+) -> dict[str, float]:
+    pinned = [field for field in fields if field in pinned_fields]
+    free = [field for field in fields if field not in pinned_fields]
+    allocated = {field: _number(values.get(field, 0.0)) for field in pinned}
+    free_target = target - sum(allocated.values())
+    free_fallback = fallback if fallback in free else (free[0] if free else fallback)
+    allocated.update(_allocate(values, free, free_target, fallback=free_fallback))
+    return allocated
+
+
+def _pinned_fields_from(values: Mapping[str, Any]) -> frozenset[str]:
+    raw = values.get("_pinned_fields")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(field for field in raw if isinstance(field, str))
 
 
 def _sum(values: Mapping[str, Any], fields: list[str]) -> float:

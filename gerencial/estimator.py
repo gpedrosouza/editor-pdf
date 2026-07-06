@@ -272,12 +272,61 @@ def build_estimated_projection(estimated: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+GROUP_WEIGHT_SPREAD = 0.6
+GOLDEN_RATIO_CONJUGATE = 0.6180339887498949
+
+
 def _build_values(ws, row_fields: dict[int, str], faturamento: float) -> dict[str, float]:
-    values: dict[str, float] = {}
-    for row, field in row_fields.items():
-        pct = _number(ws.cell(row=row, column=4).value)
-        values[field] = abs(pct * faturamento)
-    return values
+    raw_pcts = {row: _number(ws.cell(row=row, column=4).value) for row in row_fields}
+    weighted_pcts = _weight_tied_percentages(raw_pcts)
+    return {field: abs(weighted_pcts[row] * faturamento) for row, field in row_fields.items()}
+
+
+def _weight_tied_percentages(raw_pcts: dict[int, float]) -> dict[int, float]:
+    """Spread out benchmark rows that share an identical % within the same
+    spreadsheet block, so the estimate doesn't surface repeated values on
+    unrelated line items. The sum of each tied group is preserved exactly,
+    so block/DRE/Balanco totals are unaffected.
+    """
+    weighted = dict(raw_pcts)
+    for block in _contiguous_blocks(sorted(raw_pcts)):
+        groups: dict[float, list[int]] = {}
+        for row in block:
+            pct = raw_pcts[row]
+            if pct == 0:
+                continue
+            groups.setdefault(round(pct, 6), []).append(row)
+        for pct, rows in groups.items():
+            if len(rows) < 2:
+                continue
+            for row, offset in zip(rows, _irregular_offsets(rows)):
+                weighted[row] = pct * (1 + GROUP_WEIGHT_SPREAD * offset)
+    return weighted
+
+
+def _irregular_offsets(rows: list[int]) -> list[float]:
+    """Deterministic offsets in [-1, 1] with irregular (non-arithmetic) steps
+    between consecutive rows, summing to zero so the group total is preserved.
+    Uses a Weyl low-discrepancy sequence keyed by row number instead of rank,
+    so gaps between neighboring values don't form a straight staircase.
+    """
+    points = [(row * GOLDEN_RATIO_CONJUGATE) % 1.0 for row in rows]
+    mean = sum(points) / len(points)
+    deviations = [p - mean for p in points]
+    peak = max(abs(d) for d in deviations)
+    if peak == 0:
+        return [0.0 for _ in rows]
+    return [d / peak for d in deviations]
+
+
+def _contiguous_blocks(rows: list[int]) -> list[list[int]]:
+    blocks: list[list[int]] = []
+    for row in rows:
+        if blocks and row == blocks[-1][-1] + 1:
+            blocks[-1].append(row)
+        else:
+            blocks.append([row])
+    return blocks
 
 
 def _default_params_from_estimate(dre_totals: dict[str, float], faturamento: float) -> dict[str, float]:

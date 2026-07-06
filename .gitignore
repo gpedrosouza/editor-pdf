@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.venv/
 
 # Next.js
 frontend/.next/
@@ -24,6 +25,13 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Office lock files
+.~lock.*#
+~$*.xlsx
+~$*.xls
+~$*.docx
+~$*.doc
 
 # Editor
 .vscode/

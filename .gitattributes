@@ -1,0 +1,18 @@
+# Normalize line endings for all text files to LF in the repository,
+# regardless of the OS used to check them out (Windows/Linux/Mac).
+* text=auto eol=lf
+
+# Explicit binary files (never touch line endings, avoid text diffs)
+*.pdf binary
+*.xlsx binary
+*.xls binary
+*.docx binary
+*.doc binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

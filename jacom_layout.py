@@ -622,7 +622,7 @@ def gerar_dre_jacom(dados: dict, output_path: str,
 def gerar_balanco_jacom(dados: dict, output_path: str,
                         gerencial: bool = True) -> str:
     """Gera Balanco Patrimonial no padrao JACOM a partir do cenario."""
-    from gerencial.projection_engine import calculate_balanco_totals
+    from gerencial.projection_engine import calculate_balanco_totals, normalize_bancos_parceiros
 
     pdf = JacomPDF(output_path, tipo="BALANCO")
     pdf.set_empresa(
@@ -694,24 +694,36 @@ def gerar_balanco_jacom(dados: dict, output_path: str,
         'dep_ti', 'dep_instalacoes',
     ])
 
+    bancos_parceiros = normalize_bancos_parceiros(dados.get('bancos_parceiros'))
+
+    disponivel_entries = [
+        ("CAIXA GERAL", n('caixa_geral')),
+        ("CAIXA ECONOMICA FEDERAL", n('cef')),
+        ("BANCO SICOOB", n('sicoob_mov')),
+        ("BANCO DO BRASIL - APLIC.", n('bb_aplic')),
+        ("BANCO SANTANDER S.A - APLIC.", n('santander_aplic')),
+        ("TITULO DE CAPITALIZACAO", n('titulo_cap')),
+    ] + [(banco['nome'].upper(), banco['valor']) for banco in bancos_parceiros]
+
+    # The block subtotal prints on the last Disponivel line, whichever it is
+    # once the free-form bancos parceiros are appended.
+    disponivel_linhas = [
+        L(desc, par=valor, recuo=2,
+          tot=totals['disponivel'] if i == len(disponivel_entries) - 1 else None)
+        for i, (desc, valor) in enumerate(disponivel_entries)
+    ]
+
     linhas = [
         L("ATIVO", bold=True),
         L("ATIVO CIRCULANTE", bold=True),
         L("DISPONIVEL", bold=True, recuo=1),
-        L("CAIXA GERAL", par=n('caixa_geral'), recuo=2),
-        L("CAIXA ECONOMICA FEDERAL", par=n('cef'), recuo=2),
-        L("BANCO SICOOB", par=n('sicoob_mov'), recuo=2),
-        L("BANCO DO BRASIL - APLIC.", par=n('bb_aplic'), recuo=2),
-        L("BANCO SANTANDER S.A - APLIC.", par=n('santander_aplic'), recuo=2),
-        L("TITULO DE CAPITALIZACAO", par=n('titulo_cap'),
-          tot=totals['disponivel'], recuo=2),
+        *disponivel_linhas,
         SEP(),
         L("CLIENTES", bold=True, recuo=1),
         L("DUPLICATAS A RECEBER / CLIENTES", par=n('clientes'),
           tot=totals['clientes'], recuo=2),
         L("OUTROS CREDITOS", bold=True, recuo=1),
         L("ADIANTAMENTOS A FORNECEDORES", par=n('adiant_forn_1'), recuo=2),
-        L("ALVES & MORAES", par=n('adiant_forn_2'), recuo=2),
         L("ADIANTAMENTO A EMPREGADOS / FERIAS", par=n('adiant_ferias'), recuo=2),
         L("IPI A RECUPERAR", par=n('ipi_rec'), recuo=2),
         L("ICMS A RECUPERAR", par=n('icms_rec'),
@@ -750,7 +762,6 @@ def gerar_balanco_jacom(dados: dict, output_path: str,
         L("OBRIGACOES TRABALHISTAS / FOLHA", par=folha_recolher,
           recuo=1, side="C"),
         L("ADIANTAMENTO DE CLIENTES", par=n('adiant_clientes'), recuo=1, side="C"),
-        L("SORBELL / OUTROS ADIANTAMENTOS", par=n('sorbell'), recuo=1, side="C"),
         L("PARCELAMENTOS CP", par=n('parc_cp_items'),
           tot=totals['passivo_circulante'], recuo=1, side="C"),
         SEP(),

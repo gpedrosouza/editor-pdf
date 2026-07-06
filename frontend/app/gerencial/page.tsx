@@ -15,6 +15,25 @@ import {
 
 type SourceMode = "pdf" | "estimate";
 type UploadMode = "combined" | "separate";
+type BancoParceiro = { nome: string; valorText: string; valor: number };
+type ManualField = "capital_pl" | "instalacoes" | "maquinas" | "salarios";
+
+const MANUAL_FIELDS: ManualField[] = ["capital_pl", "instalacoes", "maquinas", "salarios"];
+const MANUAL_FIELD_LABELS: Record<ManualField, string> = {
+  capital_pl: "Capital Social",
+  instalacoes: "Imoveis / Instalacoes (DRE + Balanco)",
+  maquinas: "Maquinas e Equipamentos",
+  salarios: "Salarios e Ordenados",
+};
+// Some benchmark rows are the same real-world figure duplicated across DRE
+// and Balanco (e.g. "Alugueis de Imoveis" and "Imoveis / Instalacoes" share
+// one input): filling the field once applies it to every listed target.
+const MANUAL_FIELD_TARGETS: Record<ManualField, { dre?: string; balanco?: string }> = {
+  capital_pl: { balanco: "capital_pl" },
+  instalacoes: { dre: "alugueis", balanco: "instalacoes" },
+  maquinas: { balanco: "maquinas" },
+  salarios: { dre: "salarios" },
+};
 
 const DEFAULT_PARAMS: ScenarioParams = {
   meta_lucro_pct: 0.182,
@@ -30,6 +49,7 @@ const DEFAULT_DOCUMENT_DATE = new Date().toISOString().slice(0, 10);
 export default function GerencialPage() {
   const skipNextProjectionRef = useRef(false);
   const editedParamsRef = useRef<Set<keyof ScenarioParams>>(new Set());
+  const editedManualFieldsRef = useRef<Set<ManualField>>(new Set());
   const [sourceMode, setSourceMode] = useState<SourceMode>("pdf");
   const [uploadMode, setUploadMode] = useState<UploadMode>("combined");
   const [combinedPdf, setCombinedPdf] = useState<File | null>(null);
@@ -54,6 +74,19 @@ export default function GerencialPage() {
   const [accountantCpf, setAccountantCpf] = useState("");
   const [extracted, setExtracted] = useState<GerencialExtractResponse | null>(null);
   const [params, setParams] = useState<ScenarioParams>(DEFAULT_PARAMS);
+  const [manualFieldTexts, setManualFieldTexts] = useState<Record<ManualField, string>>({
+    capital_pl: "",
+    instalacoes: "",
+    maquinas: "",
+    salarios: "",
+  });
+  const [manualFieldValues, setManualFieldValues] = useState<Record<ManualField, number>>({
+    capital_pl: 0,
+    instalacoes: 0,
+    maquinas: 0,
+    salarios: 0,
+  });
+  const [bancosParceiros, setBancosParceiros] = useState<BancoParceiro[]>([]);
   const [projection, setProjection] = useState<GerencialProjection | null>(null);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isProjecting, setIsProjecting] = useState(false);
@@ -86,7 +119,7 @@ export default function GerencialPage() {
       void runProjection(extracted, params);
     }, 250);
     return () => clearTimeout(timer);
-  }, [extracted, params]);
+  }, [extracted, params, manualFieldValues, bancosParceiros]);
 
   async function handleExtract() {
     if (!canExtract || isExtracting) return;
@@ -107,6 +140,7 @@ export default function GerencialPage() {
         skipNextProjectionRef.current = true;
         setExtracted(data);
         setParams(nextParams);
+        syncManualFieldsFromExtracted(data.dre, data.balanco);
         await runProjection(data, nextParams);
       } else {
         const data = await extractGerencial({
@@ -118,6 +152,7 @@ export default function GerencialPage() {
         skipNextProjectionRef.current = true;
         setExtracted(data);
         setParams(nextParams);
+        syncManualFieldsFromExtracted(data.dre, data.balanco);
         await runProjection(data, nextParams);
       }
     } catch (err) {
@@ -133,8 +168,8 @@ export default function GerencialPage() {
     setError("");
     try {
       const next = await projectGerencial({
-        dre: data.dre,
-        balanco: data.balanco,
+        dre: buildDreOverrides(data.dre),
+        balanco: buildBalancoOverrides(data.balanco),
         params: nextParams,
       });
       setProjection(next);
@@ -163,8 +198,8 @@ export default function GerencialPage() {
     setError("");
     try {
       const blob = await generateGerencialPdf({
-        dre: extracted.dre,
-        balanco: extracted.balanco,
+        dre: buildDreOverrides(extracted.dre),
+        balanco: buildBalancoOverrides(extracted.balanco),
         params,
         documento: {
           cidade: documentCity,
@@ -329,6 +364,58 @@ export default function GerencialPage() {
           </section>
 
           <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-3">
+            <SectionTitle>Balanco</SectionTitle>
+            {MANUAL_FIELDS.map((field) => (
+              <MoneyField
+                key={field}
+                label={MANUAL_FIELD_LABELS[field]}
+                value={manualFieldTexts[field]}
+                onChange={(value) => updateManualField(field, value)}
+              />
+            ))}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted">Bancos parceiros</span>
+                <button
+                  onClick={addBancoParceiro}
+                  className="text-[11px] text-[#6366F1] font-medium"
+                >
+                  + Adicionar
+                </button>
+              </div>
+              {bancosParceiros.length === 0 && (
+                <p className="text-[11px] text-faint">Nenhum banco adicionado.</p>
+              )}
+              {bancosParceiros.map((banco, index) => (
+                <div key={index} className="grid grid-cols-[1fr_100px_20px] gap-2 items-center">
+                  <input
+                    type="text"
+                    value={banco.nome}
+                    placeholder="Nome do banco"
+                    onChange={(event) => updateBancoParceiroNome(index, event.target.value)}
+                    className="w-full h-8 rounded-md border border-[#2a2d3a] bg-[#13151f] px-2 text-xs text-[#e2e4ef] outline-none focus:border-[#6366F1]"
+                  />
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={banco.valorText}
+                    placeholder="0,00"
+                    onChange={(event) => updateBancoParceiroValor(index, event.target.value)}
+                    className="w-full h-8 rounded-md border border-[#2a2d3a] bg-[#13151f] px-2 text-right text-xs text-[#e2e4ef] outline-none focus:border-[#6366F1]"
+                  />
+                  <button
+                    onClick={() => removeBancoParceiro(index)}
+                    aria-label="Remover banco"
+                    className="h-8 w-5 flex items-center justify-center text-faint hover:text-[#ffb4b4]"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-3">
             <SectionTitle>Documento</SectionTitle>
             <TextField label="Cidade" value={documentCity} onChange={setDocumentCity} />
             <DateField label="Data emissao" value={documentDate} onChange={setDocumentDate} />
@@ -413,6 +500,98 @@ export default function GerencialPage() {
   function setParam(key: keyof ScenarioParams, value: number) {
     editedParamsRef.current.add(key);
     setParams((prev) => ({ ...prev, [key]: Number.isFinite(value) ? value : 0 }));
+  }
+
+  function buildBalancoOverrides(balanco: Record<string, unknown>): Record<string, unknown> {
+    const next: Record<string, unknown> = {
+      ...balanco,
+      bancos_parceiros: bancosParceiros
+        .filter((banco) => banco.nome.trim() !== "")
+        .map((banco) => ({ nome: banco.nome.trim(), valor: banco.valor })),
+    };
+    for (const field of MANUAL_FIELDS) {
+      const targetKey = MANUAL_FIELD_TARGETS[field].balanco;
+      if (targetKey && editedManualFieldsRef.current.has(field)) {
+        next[targetKey] = manualFieldValues[field];
+      }
+    }
+    return next;
+  }
+
+  function buildDreOverrides(dre: Record<string, unknown>): Record<string, unknown> {
+    const next: Record<string, unknown> = { ...dre };
+    const pinnedFields: string[] = [];
+    for (const field of MANUAL_FIELDS) {
+      const targetKey = MANUAL_FIELD_TARGETS[field].dre;
+      if (targetKey && editedManualFieldsRef.current.has(field)) {
+        next[targetKey] = manualFieldValues[field];
+        pinnedFields.push(targetKey);
+      }
+    }
+    // Manually entered DRE lines are treated as fixed: the reducao_cmv/despesas
+    // solver (when a net-profit target is active) recalculates around them
+    // instead of scaling them down, so the target profit is still met.
+    next._pinned_fields = pinnedFields;
+    return next;
+  }
+
+  // Keeps the manual-override inputs showing the current extracted/estimated
+  // value until the user actually types in them; fields already edited by
+  // the user keep their value across a new extraction/estimate. When a field
+  // has both a dre and a balanco target, the balanco side is used as the
+  // display source (both start out equal, before any manual edit).
+  function syncManualFieldsFromExtracted(
+    dre: Record<string, unknown>,
+    balanco: Record<string, unknown>
+  ) {
+    const sourceFor = (field: ManualField) => {
+      const targets = MANUAL_FIELD_TARGETS[field];
+      const source = targets.balanco ? balanco : dre;
+      const key = targets.balanco ?? targets.dre;
+      return key ? Number(source[key]) || 0 : 0;
+    };
+    setManualFieldTexts((prev) => {
+      const next = { ...prev };
+      for (const field of MANUAL_FIELDS) {
+        if (editedManualFieldsRef.current.has(field)) continue;
+        next[field] = formatMoneyInput(sourceFor(field));
+      }
+      return next;
+    });
+    setManualFieldValues((prev) => {
+      const next = { ...prev };
+      for (const field of MANUAL_FIELDS) {
+        if (editedManualFieldsRef.current.has(field)) continue;
+        next[field] = sourceFor(field);
+      }
+      return next;
+    });
+  }
+
+  function updateManualField(field: ManualField, text: string) {
+    editedManualFieldsRef.current.add(field);
+    setManualFieldTexts((prev) => ({ ...prev, [field]: text }));
+    setManualFieldValues((prev) => ({ ...prev, [field]: parseMoneyInput(text) }));
+  }
+
+  function addBancoParceiro() {
+    setBancosParceiros((prev) => [...prev, { nome: "", valorText: "", valor: 0 }]);
+  }
+
+  function updateBancoParceiroNome(index: number, nome: string) {
+    setBancosParceiros((prev) => prev.map((banco, i) => (i === index ? { ...banco, nome } : banco)));
+  }
+
+  function updateBancoParceiroValor(index: number, valorText: string) {
+    setBancosParceiros((prev) =>
+      prev.map((banco, i) =>
+        i === index ? { ...banco, valorText, valor: parseMoneyInput(valorText) } : banco
+      )
+    );
+  }
+
+  function removeBancoParceiro(index: number) {
+    setBancosParceiros((prev) => prev.filter((_, i) => i !== index));
   }
 
   function mergeGeneratedParams(generated: ScenarioParams): ScenarioParams {
@@ -738,6 +917,13 @@ function formatCurrency(value: number) {
   return new Intl.NumberFormat("pt-BR", {
     style: "currency",
     currency: "BRL",
+    maximumFractionDigits: 2,
+  }).format(value || 0);
+}
+
+function formatMoneyInput(value: number) {
+  return new Intl.NumberFormat("pt-BR", {
+    minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value || 0);
 }
