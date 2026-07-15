@@ -2,28 +2,61 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  CurvaAbcCliente,
+  CurvaAbcProjectionPayload,
+  CurvaAbcProjectionSummary,
   GerencialApiError,
   GerencialExtractResponse,
+  GerencialLayout,
   GerencialProjection,
+  GerencialProjectionPayload,
+  GerencialProjectionSummary,
   ScenarioParams,
+  createCurvaAbcProjection,
+  createGerencialProjection,
+  deleteCurvaAbcProjection,
+  deleteGerencialProjection,
+  estimateCurvaAbc,
   estimateGerencial,
   extractGerencial,
+  generateCurvaAbcPdf,
   generateGerencialPdf,
+  getCurvaAbcProjection,
   getEstimatorSectors,
+  getGerencialProjection,
+  listCurvaAbcProjections,
+  listGerencialProjections,
   projectGerencial,
+  updateCurvaAbcProjection,
+  updateGerencialProjection,
 } from "@/lib/gerencialApi";
+import { parseClientesFile } from "@/lib/curvaAbc";
 
 type SourceMode = "pdf" | "estimate";
 type UploadMode = "combined" | "separate";
+type CurvaAbcModo = "real" | "estimate";
 type BancoParceiro = { nome: string; valorText: string; valor: number };
-type ManualField = "capital_pl" | "instalacoes" | "maquinas" | "salarios";
+type ManualField = "capital_pl" | "instalacoes" | "maquinas" | "salarios" | "fornecedores_total";
 
-const MANUAL_FIELDS: ManualField[] = ["capital_pl", "instalacoes", "maquinas", "salarios"];
+const LAYOUT_OPTIONS: { value: GerencialLayout; label: string }[] = [
+  { value: "jacom", label: "JACOM (padrão)" },
+  { value: "moderno", label: "Extrato Gerencial" },
+  { value: "formal", label: "Relatório Patrimonial" },
+];
+
+const MANUAL_FIELDS: ManualField[] = [
+  "capital_pl",
+  "instalacoes",
+  "maquinas",
+  "salarios",
+  "fornecedores_total",
+];
 const MANUAL_FIELD_LABELS: Record<ManualField, string> = {
   capital_pl: "Capital Social",
   instalacoes: "Imoveis / Instalacoes (DRE + Balanco)",
   maquinas: "Maquinas e Equipamentos",
   salarios: "Salarios e Ordenados",
+  fornecedores_total: "Fornecedores (Total)",
 };
 // Some benchmark rows are the same real-world figure duplicated across DRE
 // and Balanco (e.g. "Alugueis de Imoveis" and "Imoveis / Instalacoes" share
@@ -33,6 +66,7 @@ const MANUAL_FIELD_TARGETS: Record<ManualField, { dre?: string; balanco?: string
   instalacoes: { dre: "alugueis", balanco: "instalacoes" },
   maquinas: { balanco: "maquinas" },
   salarios: { dre: "salarios" },
+  fornecedores_total: { balanco: "fornecedores_total" },
 };
 
 const DEFAULT_PARAMS: ScenarioParams = {
@@ -66,6 +100,7 @@ export default function GerencialPage() {
   const [estimatePeriod, setEstimatePeriod] = useState("");
   const [documentCity, setDocumentCity] = useState("BOTUCATU");
   const [documentDate, setDocumentDate] = useState(DEFAULT_DOCUMENT_DATE);
+  const [pdfLayout, setPdfLayout] = useState<GerencialLayout>("jacom");
   const [businessOwnerName, setBusinessOwnerName] = useState("");
   const [businessOwnerRole, setBusinessOwnerRole] = useState("EMPRESARIO");
   const [businessOwnerCpf, setBusinessOwnerCpf] = useState("");
@@ -79,12 +114,14 @@ export default function GerencialPage() {
     instalacoes: "",
     maquinas: "",
     salarios: "",
+    fornecedores_total: "",
   });
   const [manualFieldValues, setManualFieldValues] = useState<Record<ManualField, number>>({
     capital_pl: 0,
     instalacoes: 0,
     maquinas: 0,
     salarios: 0,
+    fornecedores_total: 0,
   });
   const [bancosParceiros, setBancosParceiros] = useState<BancoParceiro[]>([]);
   const [projection, setProjection] = useState<GerencialProjection | null>(null);
@@ -92,6 +129,36 @@ export default function GerencialPage() {
   const [isProjecting, setIsProjecting] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState("");
+  const [currentProjectionId, setCurrentProjectionId] = useState<number | null>(null);
+  const [projectionName, setProjectionName] = useState("");
+  const [savedProjections, setSavedProjections] = useState<GerencialProjectionSummary[]>([]);
+  const [isSavingProjection, setIsSavingProjection] = useState(false);
+  const [isLoadingProjection, setIsLoadingProjection] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+
+  // Curva ABC de Vendas - independent report, own state, shares only
+  // estimateRevenue/estimateRevenueText with the Faturamento tab above.
+  const [curvaAbcModo, setCurvaAbcModo] = useState<CurvaAbcModo>("estimate");
+  const [curvaAbcEmpresa, setCurvaAbcEmpresa] = useState("");
+  const [curvaAbcPeriodoIni, setCurvaAbcPeriodoIni] = useState("");
+  const [curvaAbcPeriodoFim, setCurvaAbcPeriodoFim] = useState("");
+  const [curvaAbcVersaoGerencial, setCurvaAbcVersaoGerencial] = useState(true);
+  const [curvaAbcNumeroClientes, setCurvaAbcNumeroClientes] = useState(106);
+  const [curvaAbcConcentracao, setCurvaAbcConcentracao] = useState(1.6);
+  const [curvaAbcClientes, setCurvaAbcClientes] = useState<CurvaAbcCliente[]>([]);
+  const [curvaAbcFile, setCurvaAbcFile] = useState<File | null>(null);
+  const [curvaAbcSkippedRows, setCurvaAbcSkippedRows] = useState(0);
+  const [isEstimatingCurvaAbc, setIsEstimatingCurvaAbc] = useState(false);
+  const [isParsingCurvaAbcFile, setIsParsingCurvaAbcFile] = useState(false);
+  const [isGeneratingCurvaAbc, setIsGeneratingCurvaAbc] = useState(false);
+  const [curvaAbcColisoesWarning, setCurvaAbcColisoesWarning] = useState<number | null>(null);
+  const [curvaAbcError, setCurvaAbcError] = useState("");
+  const [curvaAbcProjectionName, setCurvaAbcProjectionName] = useState("");
+  const [currentCurvaAbcProjectionId, setCurrentCurvaAbcProjectionId] = useState<number | null>(null);
+  const [savedCurvaAbcProjections, setSavedCurvaAbcProjections] = useState<CurvaAbcProjectionSummary[]>([]);
+  const [isSavingCurvaAbcProjection, setIsSavingCurvaAbcProjection] = useState(false);
+  const [isLoadingCurvaAbcProjection, setIsLoadingCurvaAbcProjection] = useState(false);
+  const [isLoadingCurvaAbcHistory, setIsLoadingCurvaAbcHistory] = useState(false);
 
   const canExtract = useMemo(() => {
     if (sourceMode === "estimate") return estimateRevenue > 0;
@@ -107,6 +174,14 @@ export default function GerencialPage() {
         setEstimateSector(sectors[0].id);
       })
       .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    void refreshHistory();
+  }, []);
+
+  useEffect(() => {
+    void refreshCurvaAbcHistory();
   }, []);
 
   useEffect(() => {
@@ -228,12 +303,343 @@ export default function GerencialPage() {
             }
           : undefined,
         tipo,
+        layout: pdfLayout,
       });
       downloadBlob(blob, filenameFor(tipo));
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
       setIsGenerating(false);
+    }
+  }
+
+  function buildProjectionPayload(): GerencialProjectionPayload {
+    if (!extracted) throw new Error("Nenhum cenario para salvar.");
+    return {
+      scenario: { dre: extracted.dre, balanco: extracted.balanco, params },
+      manual: {
+        values: manualFieldValues,
+        editedFields: Array.from(editedManualFieldsRef.current),
+      },
+      editedParams: Array.from(editedParamsRef.current),
+      bancosParceiros: bancosParceiros
+        .filter((banco) => banco.nome.trim() !== "")
+        .map((banco) => ({ nome: banco.nome.trim(), valor: banco.valor })),
+      documento: {
+        cidade: documentCity,
+        dataEmissao: documentDate,
+        businessOwnerName,
+        businessOwnerRole,
+        businessOwnerCpf,
+        accountantName,
+        accountantCrc,
+        accountantCpf,
+      },
+      meta: {
+        sourceMode,
+        uploadMode,
+        estimateRevenue,
+        estimateSector,
+        estimateCompany,
+        estimateCnpj,
+        estimatePeriod,
+        pdfLayout,
+      },
+    };
+  }
+
+  async function handleSaveProjection() {
+    if (!extracted || !projectionName.trim() || isSavingProjection) return;
+    setIsSavingProjection(true);
+    setError("");
+    try {
+      const record = await createGerencialProjection(projectionName.trim(), buildProjectionPayload());
+      setCurrentProjectionId(record.id);
+      await refreshHistory();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsSavingProjection(false);
+    }
+  }
+
+  async function handleUpdateProjection() {
+    if (!extracted || currentProjectionId === null || !projectionName.trim() || isSavingProjection) return;
+    setIsSavingProjection(true);
+    setError("");
+    try {
+      const record = await updateGerencialProjection(
+        currentProjectionId,
+        projectionName.trim(),
+        buildProjectionPayload()
+      );
+      setCurrentProjectionId(record.id);
+      await refreshHistory();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsSavingProjection(false);
+    }
+  }
+
+  async function handleLoadProjection(id: number) {
+    if (isLoadingProjection) return;
+    setIsLoadingProjection(true);
+    setError("");
+    try {
+      const record = await getGerencialProjection(id);
+      const p = record.payload;
+
+      editedParamsRef.current = new Set(p.editedParams as (keyof ScenarioParams)[]);
+      editedManualFieldsRef.current = new Set(p.manual.editedFields as ManualField[]);
+
+      // Same pattern as handleExtract: batch-set state with the debounced
+      // projection effect skipped once, then explicitly run the projection.
+      skipNextProjectionRef.current = true;
+
+      setProjectionName(record.nome);
+      setCurrentProjectionId(record.id);
+
+      setSourceMode(p.meta.sourceMode);
+      setUploadMode(p.meta.uploadMode);
+      setEstimateRevenue(p.meta.estimateRevenue);
+      setEstimateRevenueText(formatMoneyInput(p.meta.estimateRevenue));
+      setEstimateSector(p.meta.estimateSector);
+      setEstimateCompany(p.meta.estimateCompany);
+      setEstimateCnpj(p.meta.estimateCnpj);
+      setEstimatePeriod(p.meta.estimatePeriod);
+      setPdfLayout(p.meta.pdfLayout);
+
+      setDocumentCity(p.documento.cidade);
+      setDocumentDate(p.documento.dataEmissao);
+      setBusinessOwnerName(p.documento.businessOwnerName);
+      setBusinessOwnerRole(p.documento.businessOwnerRole);
+      setBusinessOwnerCpf(p.documento.businessOwnerCpf);
+      setAccountantName(p.documento.accountantName);
+      setAccountantCrc(p.documento.accountantCrc);
+      setAccountantCpf(p.documento.accountantCpf);
+
+      setParams(p.scenario.params);
+
+      const nextManualValues = { ...manualFieldValues, ...p.manual.values } as Record<ManualField, number>;
+      setManualFieldValues(nextManualValues);
+      setManualFieldTexts(
+        MANUAL_FIELDS.reduce((acc, field) => {
+          acc[field] = formatMoneyInput(nextManualValues[field] ?? 0);
+          return acc;
+        }, {} as Record<ManualField, string>)
+      );
+
+      setBancosParceiros(
+        p.bancosParceiros.map((banco) => ({
+          nome: banco.nome,
+          valor: banco.valor,
+          valorText: formatMoneyInput(banco.valor),
+        }))
+      );
+
+      // File objects can't be persisted/restored - the already-extracted
+      // dre/balanco below is everything a reload needs to keep editing.
+      setCombinedPdf(null);
+      setDrePdf(null);
+      setBalancoPdf(null);
+
+      const nextExtracted: GerencialExtractResponse = {
+        dre: p.scenario.dre,
+        balanco: p.scenario.balanco,
+        params: p.scenario.params,
+      };
+      setExtracted(nextExtracted);
+
+      await runProjection(nextExtracted, p.scenario.params);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsLoadingProjection(false);
+    }
+  }
+
+  async function handleDeleteProjection(id: number) {
+    setError("");
+    try {
+      await deleteGerencialProjection(id);
+      if (currentProjectionId === id) setCurrentProjectionId(null);
+      await refreshHistory();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  }
+
+  async function refreshHistory() {
+    setIsLoadingHistory(true);
+    try {
+      setSavedProjections(await listGerencialProjections());
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }
+
+  async function handleEstimateCurvaAbc() {
+    if (estimateRevenue <= 0 || isEstimatingCurvaAbc) return;
+    setIsEstimatingCurvaAbc(true);
+    setCurvaAbcError("");
+    try {
+      const data = await estimateCurvaAbc({
+        faturamento_total: estimateRevenue,
+        numero_clientes: curvaAbcNumeroClientes,
+        concentracao: curvaAbcConcentracao,
+      });
+      setCurvaAbcClientes(data.clientes);
+      setCurvaAbcSkippedRows(0);
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsEstimatingCurvaAbc(false);
+    }
+  }
+
+  async function handleCurvaAbcFileChange(file: File | null) {
+    setCurvaAbcFile(file);
+    if (!file) return;
+    setIsParsingCurvaAbcFile(true);
+    setCurvaAbcError("");
+    try {
+      const { clientes, skippedRows } = await parseClientesFile(file);
+      setCurvaAbcClientes(clientes);
+      setCurvaAbcSkippedRows(skippedRows);
+    } catch {
+      setCurvaAbcError("Nao foi possivel ler o arquivo. Verifique se e um XLSX ou CSV valido.");
+    } finally {
+      setIsParsingCurvaAbcFile(false);
+    }
+  }
+
+  async function handleGenerateCurvaAbc() {
+    if (curvaAbcClientes.length === 0 || isGeneratingCurvaAbc) return;
+    setIsGeneratingCurvaAbc(true);
+    setCurvaAbcError("");
+    setCurvaAbcColisoesWarning(null);
+    try {
+      const { blob, colisoes } = await generateCurvaAbcPdf({
+        clientes: curvaAbcClientes,
+        periodo_ini: curvaAbcPeriodoIni,
+        periodo_fim: curvaAbcPeriodoFim,
+        empresa: curvaAbcEmpresa || "01-EMPRESA",
+        versao_gerencial: curvaAbcVersaoGerencial,
+      });
+      downloadBlob(blob, "CURVA_ABC.pdf");
+      if (colisoes > 0) setCurvaAbcColisoesWarning(colisoes);
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsGeneratingCurvaAbc(false);
+    }
+  }
+
+  function buildCurvaAbcPayload(): CurvaAbcProjectionPayload {
+    return {
+      clientes: curvaAbcClientes,
+      meta: {
+        empresa: curvaAbcEmpresa,
+        periodo_ini: curvaAbcPeriodoIni,
+        periodo_fim: curvaAbcPeriodoFim,
+        data_emissao: "",
+        modo: curvaAbcModo,
+        versaoGerencial: curvaAbcVersaoGerencial,
+        faturamentoTotal: estimateRevenue,
+        numeroClientes: curvaAbcNumeroClientes,
+        concentracao: curvaAbcConcentracao,
+      },
+    };
+  }
+
+  async function handleSaveCurvaAbcProjection() {
+    if (curvaAbcClientes.length === 0 || !curvaAbcProjectionName.trim() || isSavingCurvaAbcProjection) return;
+    setIsSavingCurvaAbcProjection(true);
+    setCurvaAbcError("");
+    try {
+      const record = await createCurvaAbcProjection(curvaAbcProjectionName.trim(), buildCurvaAbcPayload());
+      setCurrentCurvaAbcProjectionId(record.id);
+      await refreshCurvaAbcHistory();
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsSavingCurvaAbcProjection(false);
+    }
+  }
+
+  async function handleUpdateCurvaAbcProjection() {
+    if (
+      curvaAbcClientes.length === 0 ||
+      currentCurvaAbcProjectionId === null ||
+      !curvaAbcProjectionName.trim() ||
+      isSavingCurvaAbcProjection
+    )
+      return;
+    setIsSavingCurvaAbcProjection(true);
+    setCurvaAbcError("");
+    try {
+      const record = await updateCurvaAbcProjection(
+        currentCurvaAbcProjectionId,
+        curvaAbcProjectionName.trim(),
+        buildCurvaAbcPayload()
+      );
+      setCurrentCurvaAbcProjectionId(record.id);
+      await refreshCurvaAbcHistory();
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsSavingCurvaAbcProjection(false);
+    }
+  }
+
+  async function handleLoadCurvaAbcProjection(id: number) {
+    if (isLoadingCurvaAbcProjection) return;
+    setIsLoadingCurvaAbcProjection(true);
+    setCurvaAbcError("");
+    try {
+      const record = await getCurvaAbcProjection(id);
+      const p = record.payload;
+      setCurvaAbcProjectionName(record.nome);
+      setCurrentCurvaAbcProjectionId(record.id);
+      setCurvaAbcClientes(p.clientes);
+      setCurvaAbcEmpresa(p.meta.empresa);
+      setCurvaAbcPeriodoIni(p.meta.periodo_ini);
+      setCurvaAbcPeriodoFim(p.meta.periodo_fim);
+      setCurvaAbcVersaoGerencial(p.meta.versaoGerencial);
+      setCurvaAbcModo(p.meta.modo);
+      setCurvaAbcNumeroClientes(p.meta.numeroClientes);
+      setCurvaAbcConcentracao(p.meta.concentracao);
+      setCurvaAbcSkippedRows(0);
+      setCurvaAbcFile(null);
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsLoadingCurvaAbcProjection(false);
+    }
+  }
+
+  async function handleDeleteCurvaAbcProjection(id: number) {
+    setCurvaAbcError("");
+    try {
+      await deleteCurvaAbcProjection(id);
+      if (currentCurvaAbcProjectionId === id) setCurrentCurvaAbcProjectionId(null);
+      await refreshCurvaAbcHistory();
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    }
+  }
+
+  async function refreshCurvaAbcHistory() {
+    setIsLoadingCurvaAbcHistory(true);
+    try {
+      setSavedCurvaAbcProjections(await listCurvaAbcProjections());
+    } catch (err) {
+      setCurvaAbcError(getErrorMessage(err));
+    } finally {
+      setIsLoadingCurvaAbcHistory(false);
     }
   }
 
@@ -429,6 +835,12 @@ export default function GerencialPage() {
 
           <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-2">
             <SectionTitle>Gerar PDF</SectionTitle>
+            <SelectField
+              label="Layout"
+              value={pdfLayout}
+              onChange={(value) => setPdfLayout(value as GerencialLayout)}
+              options={LAYOUT_OPTIONS.map((option) => ({ id: option.value, label: option.label }))}
+            />
             <ActionButton disabled={!projection || isGenerating} onClick={() => handleGenerate("completo")}>
               <DownloadIcon />
               Completo
@@ -443,11 +855,277 @@ export default function GerencialPage() {
             </div>
           </section>
 
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-2">
+            <SectionTitle>Salvar Projecao</SectionTitle>
+            <TextField
+              label="Nome"
+              value={projectionName}
+              onChange={setProjectionName}
+              placeholder="Ex: Cliente X - Julho/2026"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <ActionButton
+                muted
+                disabled={!extracted || !projectionName.trim() || isSavingProjection}
+                onClick={handleSaveProjection}
+              >
+                {isSavingProjection ? <SpinnerIcon /> : <SaveIcon />}
+                Salvar (novo)
+              </ActionButton>
+              <ActionButton
+                muted
+                disabled={
+                  !extracted || currentProjectionId === null || !projectionName.trim() || isSavingProjection
+                }
+                onClick={handleUpdateProjection}
+              >
+                Atualizar
+              </ActionButton>
+            </div>
+          </section>
+
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <SectionTitle>Historico</SectionTitle>
+              {isLoadingHistory && <span className="text-[11px] text-faint">Carregando...</span>}
+            </div>
+            {savedProjections.length === 0 ? (
+              <p className="text-[11px] text-faint">Nenhuma projecao salva ainda.</p>
+            ) : (
+              <div className="space-y-2 max-h-64 overflow-auto">
+                {savedProjections.map((item) => (
+                  <div
+                    key={item.id}
+                    className="border border-[#2a2d3a] rounded-md p-2 space-y-1.5"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-[#e2e4ef] font-medium truncate flex-1">
+                        {item.nome}
+                      </span>
+                      {item.id === currentProjectionId && (
+                        <span className="text-[10px] bg-[#6366F1] text-white rounded px-1.5 py-0.5">
+                          atual
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-faint truncate">
+                      {item.empresa || "Sem empresa"} · {formatDateTime(item.updated_at)}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => handleLoadProjection(item.id)}
+                        disabled={isLoadingProjection}
+                        className="h-7 rounded border border-[#2a2d3a] text-[11px] text-muted disabled:opacity-45"
+                      >
+                        Carregar
+                      </button>
+                      <button
+                        onClick={() => handleDeleteProjection(item.id)}
+                        className="h-7 rounded border border-[#2a2d3a] text-[11px] text-[#ffb4b4]"
+                      >
+                        Excluir
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
           {error && (
             <div className="border border-[#6E1A1A] bg-[#2a1114] text-[#ffb4b4] text-xs rounded-md p-3 leading-relaxed">
               {error}
             </div>
           )}
+
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-3">
+            <SectionTitle>Curva ABC de Vendas</SectionTitle>
+
+            <SegmentedControl
+              value={curvaAbcModo}
+              onChange={setCurvaAbcModo}
+              options={[
+                { value: "real", label: "Dados reais" },
+                { value: "estimate", label: "Estimativa" },
+              ]}
+            />
+
+            <TextField label="Empresa" value={curvaAbcEmpresa} onChange={setCurvaAbcEmpresa} placeholder="01-EMPRESA" />
+            <TextField
+              label="Periodo inicio"
+              value={curvaAbcPeriodoIni}
+              onChange={setCurvaAbcPeriodoIni}
+              placeholder="01/06/2026"
+            />
+            <TextField
+              label="Periodo fim"
+              value={curvaAbcPeriodoFim}
+              onChange={setCurvaAbcPeriodoFim}
+              placeholder="30/06/2026"
+            />
+
+            {curvaAbcModo === "estimate" ? (
+              <>
+                <MoneyField
+                  label="Faturamento anual"
+                  value={estimateRevenueText}
+                  onChange={(value) => {
+                    setEstimateRevenueText(value);
+                    setEstimateRevenue(parseMoneyInput(value));
+                  }}
+                />
+                <NumberField
+                  label="Numero de clientes"
+                  value={curvaAbcNumeroClientes}
+                  onChange={(v) => setCurvaAbcNumeroClientes(Math.max(1, Math.round(v)))}
+                />
+                <NumberField label="Concentracao" value={curvaAbcConcentracao} onChange={setCurvaAbcConcentracao} />
+                <ActionButton
+                  muted
+                  disabled={estimateRevenue <= 0 || isEstimatingCurvaAbc}
+                  onClick={handleEstimateCurvaAbc}
+                >
+                  {isEstimatingCurvaAbc ? <SpinnerIcon /> : null}
+                  Gerar lista estimada
+                </ActionButton>
+              </>
+            ) : (
+              <label className="block space-y-1">
+                <span className="text-xs text-muted">Planilha de clientes (XLSX/CSV)</span>
+                <input
+                  type="file"
+                  accept=".xlsx,.xls,.csv"
+                  onChange={(event) => void handleCurvaAbcFileChange(event.target.files?.[0] ?? null)}
+                  className="block w-full text-xs text-muted file:mr-3 file:h-8 file:rounded-md file:border-0 file:bg-[#2a2d3a] file:px-3 file:text-xs file:text-[#e2e4ef]"
+                />
+                {curvaAbcFile && <span className="block text-[11px] text-faint truncate">{curvaAbcFile.name}</span>}
+                {isParsingCurvaAbcFile && <span className="block text-[11px] text-faint">Lendo arquivo...</span>}
+                {curvaAbcSkippedRows > 0 && (
+                  <span className="block text-[11px] text-[#ffb4b4]">
+                    {curvaAbcSkippedRows} linha(s) ignorada(s) (nome ou valor invalido).
+                  </span>
+                )}
+              </label>
+            )}
+
+            {curvaAbcClientes.length > 0 && (
+              <CurvaAbcClientTable
+                clientes={curvaAbcClientes}
+                editableNamesOnly={curvaAbcModo === "estimate"}
+                onChange={setCurvaAbcClientes}
+              />
+            )}
+
+            <label className="flex items-center gap-2 text-xs text-muted">
+              <input
+                type="checkbox"
+                checked={curvaAbcVersaoGerencial}
+                onChange={(event) => setCurvaAbcVersaoGerencial(event.target.checked)}
+              />
+              Marcar como versao gerencial interna
+            </label>
+
+            <ActionButton
+              disabled={
+                curvaAbcClientes.length === 0 ||
+                !curvaAbcPeriodoIni ||
+                !curvaAbcPeriodoFim ||
+                isGeneratingCurvaAbc
+              }
+              onClick={handleGenerateCurvaAbc}
+            >
+              {isGeneratingCurvaAbc ? <SpinnerIcon /> : <DownloadIcon />}
+              Gerar Curva ABC
+            </ActionButton>
+
+            {curvaAbcColisoesWarning !== null && curvaAbcColisoesWarning > 0 && (
+              <div className="border border-[#6E1A1A] bg-[#2a1114] text-[#ffb4b4] text-[11px] rounded-md p-2">
+                Atencao: {curvaAbcColisoesWarning} possivel(is) colisao(oes) de texto detectada(s) no PDF gerado.
+                O download foi concluido normalmente; revise o layout se necessario.
+              </div>
+            )}
+
+            {curvaAbcError && (
+              <div className="border border-[#6E1A1A] bg-[#2a1114] text-[#ffb4b4] text-xs rounded-md p-3 leading-relaxed">
+                {curvaAbcError}
+              </div>
+            )}
+          </section>
+
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-2">
+            <SectionTitle>Salvar Curva ABC</SectionTitle>
+            <TextField
+              label="Nome"
+              value={curvaAbcProjectionName}
+              onChange={setCurvaAbcProjectionName}
+              placeholder="Ex: Curva ABC - Julho/2026"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <ActionButton
+                muted
+                disabled={
+                  curvaAbcClientes.length === 0 || !curvaAbcProjectionName.trim() || isSavingCurvaAbcProjection
+                }
+                onClick={handleSaveCurvaAbcProjection}
+              >
+                {isSavingCurvaAbcProjection ? <SpinnerIcon /> : <SaveIcon />}
+                Salvar (novo)
+              </ActionButton>
+              <ActionButton
+                muted
+                disabled={
+                  curvaAbcClientes.length === 0 ||
+                  currentCurvaAbcProjectionId === null ||
+                  !curvaAbcProjectionName.trim() ||
+                  isSavingCurvaAbcProjection
+                }
+                onClick={handleUpdateCurvaAbcProjection}
+              >
+                Atualizar
+              </ActionButton>
+            </div>
+          </section>
+
+          <section className="border border-[#2a2d3a] rounded-lg bg-[#1e2130] p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <SectionTitle>Historico Curva ABC</SectionTitle>
+              {isLoadingCurvaAbcHistory && <span className="text-[11px] text-faint">Carregando...</span>}
+            </div>
+            {savedCurvaAbcProjections.length === 0 ? (
+              <p className="text-[11px] text-faint">Nenhuma Curva ABC salva ainda.</p>
+            ) : (
+              <div className="space-y-2 max-h-64 overflow-auto">
+                {savedCurvaAbcProjections.map((item) => (
+                  <div key={item.id} className="border border-[#2a2d3a] rounded-md p-2 space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-[#e2e4ef] font-medium truncate flex-1">{item.nome}</span>
+                      {item.id === currentCurvaAbcProjectionId && (
+                        <span className="text-[10px] bg-[#6366F1] text-white rounded px-1.5 py-0.5">atual</span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-faint truncate">
+                      {item.empresa || "Sem empresa"} · {item.total_clientes} clientes · {formatDateTime(item.updated_at)}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => handleLoadCurvaAbcProjection(item.id)}
+                        disabled={isLoadingCurvaAbcProjection}
+                        className="h-7 rounded border border-[#2a2d3a] text-[11px] text-muted disabled:opacity-45"
+                      >
+                        Carregar
+                      </button>
+                      <button
+                        onClick={() => handleDeleteCurvaAbcProjection(item.id)}
+                        className="h-7 rounded border border-[#2a2d3a] text-[11px] text-[#ffb4b4]"
+                      >
+                        Excluir
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </aside>
 
         <section className="p-4 md:p-6 overflow-auto">
@@ -818,6 +1496,67 @@ function ActionButton({
   );
 }
 
+function CurvaAbcClientTable({
+  clientes,
+  editableNamesOnly,
+  onChange,
+}: {
+  clientes: CurvaAbcCliente[];
+  editableNamesOnly: boolean;
+  onChange: (clientes: CurvaAbcCliente[]) => void;
+}) {
+  const total = clientes.reduce((sum, c) => sum + c.valor, 0);
+  return (
+    <div className="space-y-1">
+      <div className="max-h-56 overflow-auto border border-[#2a2d3a] rounded-md">
+        <table className="w-full text-[11px]">
+          <thead className="bg-[#13151f] text-faint sticky top-0">
+            <tr>
+              <th className="text-left px-2 py-1 font-medium">Nome</th>
+              <th className="text-right px-2 py-1 font-medium">Valor</th>
+            </tr>
+          </thead>
+          <tbody>
+            {clientes.map((c, i) => (
+              <tr key={i} className="border-t border-[#242735]">
+                <td className="px-2 py-1">
+                  <input
+                    value={c.nome}
+                    onChange={(event) => {
+                      const next = [...clientes];
+                      next[i] = { ...c, nome: event.target.value };
+                      onChange(next);
+                    }}
+                    className="w-full bg-transparent text-[#e2e4ef] outline-none"
+                  />
+                </td>
+                <td className="px-2 py-1 text-right">
+                  {editableNamesOnly ? (
+                    <span className="text-[#e2e4ef]">{formatCurrency(c.valor)}</span>
+                  ) : (
+                    <input
+                      value={formatMoneyInput(c.valor)}
+                      onChange={(event) => {
+                        const next = [...clientes];
+                        next[i] = { ...c, valor: parseMoneyInput(event.target.value) };
+                        onChange(next);
+                      }}
+                      className="w-full bg-transparent text-right text-[#e2e4ef] outline-none"
+                    />
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-[11px] text-faint text-right">
+        {clientes.length} clientes · Total: {formatCurrency(total)}
+      </div>
+    </div>
+  );
+}
+
 function MetricGrid({ projection }: { projection: GerencialProjection }) {
   const rows = [
     ["Resultado", formatCurrency(projection.scenario.dre_totals.resultado_exercicio)],
@@ -921,6 +1660,15 @@ function formatCurrency(value: number) {
   }).format(value || 0);
 }
 
+function formatDateTime(isoString: string) {
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return isoString;
+  return new Intl.DateTimeFormat("pt-BR", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(date);
+}
+
 function formatMoneyInput(value: number) {
   return new Intl.NumberFormat("pt-BR", {
     minimumFractionDigits: 2,
@@ -1011,6 +1759,16 @@ function DownloadIcon() {
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
       <polyline points="7 10 12 15 17 10" />
       <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  );
+}
+
+function SaveIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+      <polyline points="17 21 17 13 7 13 7 21" />
+      <polyline points="7 3 7 8 15 8" />
     </svg>
   );
 }

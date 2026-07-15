@@ -11,6 +11,7 @@ from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
+import gerencial.storage as storage
 from gerencial.estimator import (
     EstimateInput,
     build_estimated_projection,
@@ -21,6 +22,7 @@ from gerencial.projection_engine import ScenarioParams, project_all
 
 
 app = FastAPI(title="JACOM Projecao Gerencial", version="0.1.0")
+storage.init_db()
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,9 +135,18 @@ async def project(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 @app.post("/api/gerencial/pdf")
 async def generate_pdf(payload: dict[str, Any] = Body(...)) -> Response:
+    from jacom_layout import LAYOUTS_DISPONIVEIS
+
     tipo = str(payload.get("tipo") or "completo").lower()
     if tipo not in {"dre", "balanco", "completo"}:
         raise HTTPException(status_code=400, detail="tipo deve ser `dre`, `balanco` ou `completo`.")
+
+    layout = str(payload.get("layout") or "jacom").lower()
+    if layout not in LAYOUTS_DISPONIVEIS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"layout deve ser um de: {', '.join(LAYOUTS_DISPONIVEIS)}.",
+        )
 
     scenario = payload.get("scenario")
     if isinstance(scenario, dict) and isinstance(scenario.get("dre"), dict):
@@ -179,7 +190,7 @@ async def generate_pdf(payload: dict[str, Any] = Body(...)) -> Response:
     }
 
     try:
-        pdf_bytes = _render_pdf(tipo, dre_data, balanco_data)
+        pdf_bytes = _render_pdf(tipo, dre_data, balanco_data, layout)
     except ModuleNotFoundError as exc:
         raise HTTPException(
             status_code=500,
@@ -201,6 +212,198 @@ async def generate_pdf(payload: dict[str, Any] = Body(...)) -> Response:
     )
 
 
+CURVA_ABC_COLISOES_HEADER = "X-Curva-Abc-Colisoes"
+
+
+@app.post("/api/gerencial/curva-abc/estimate")
+async def estimate_curva_abc(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from curva_abc_gerador import estimar_curva_abc
+
+    faturamento_total = float(payload.get("faturamento_total") or 0)
+    if faturamento_total <= 0:
+        raise HTTPException(status_code=400, detail="Campo `faturamento_total` deve ser maior que zero.")
+
+    numero_clientes = int(payload.get("numero_clientes") or 106)
+    concentracao = float(payload.get("concentracao") or 1.6)
+
+    try:
+        clientes = estimar_curva_abc(
+            faturamento_total=faturamento_total,
+            numero_clientes=numero_clientes,
+            concentracao=concentracao,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Falha ao estimar Curva ABC: {exc}") from exc
+
+    return {
+        "clientes": clientes,
+        "total_clientes": len(clientes),
+        "total_valor": sum(c["valor"] for c in clientes),
+    }
+
+
+@app.post("/api/gerencial/curva-abc/pdf")
+async def generate_curva_abc_pdf(payload: dict[str, Any] = Body(...)) -> Response:
+    clientes = payload.get("clientes")
+    if not isinstance(clientes, list) or not clientes:
+        raise HTTPException(status_code=400, detail="Campo `clientes` deve ser uma lista nao vazia.")
+
+    for c in clientes:
+        if not isinstance(c, dict) or "nome" not in c or "valor" not in c:
+            raise HTTPException(status_code=400, detail="Cada cliente deve ter `nome` e `valor`.")
+
+    clientes_norm = [
+        {
+            "cnpj_cpf": str(c.get("cnpj_cpf") or ""),
+            "nome": str(c.get("nome") or ""),
+            "valor": float(c.get("valor") or 0),
+        }
+        for c in clientes
+    ]
+
+    periodo_ini = str(payload.get("periodo_ini") or "").strip()
+    periodo_fim = str(payload.get("periodo_fim") or "").strip()
+    if not periodo_ini or not periodo_fim:
+        raise HTTPException(
+            status_code=400,
+            detail="Campos `periodo_ini` e `periodo_fim` sao obrigatorios (dd/mm/aaaa).",
+        )
+
+    empresa = str(payload.get("empresa") or "01-EMPRESA")
+    versao_gerencial = bool(payload.get("versao_gerencial", True))
+    data_emissao = payload.get("data_emissao") or None
+
+    try:
+        pdf_bytes, n_colisoes = _render_curva_abc_pdf(
+            clientes_norm, periodo_ini, periodo_fim, empresa, versao_gerencial, data_emissao
+        )
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dependencia Python ausente: {exc.name}. Rode `pip install -r requirements.txt`.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Falha ao gerar PDF da Curva ABC: {exc}") from exc
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="CURVA_ABC.pdf"',
+            CURVA_ABC_COLISOES_HEADER: str(n_colisoes),
+        },
+    )
+
+
+@app.post("/api/gerencial/curva-abc/projections")
+async def create_curva_abc_projection(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    nome, payload = _validate_projection_body(body)
+    empresa, periodo_ini, periodo_fim, modo, total_clientes, total_valor = _curva_abc_listing_fields(payload)
+    return storage.save_curva_abc_projection(
+        nome, empresa, periodo_ini, periodo_fim, modo, total_clientes, total_valor, payload
+    )
+
+
+@app.get("/api/gerencial/curva-abc/projections")
+async def list_curva_abc_projections() -> dict[str, Any]:
+    return {"projections": storage.list_curva_abc_projections()}
+
+
+@app.get("/api/gerencial/curva-abc/projections/{projection_id}")
+async def get_curva_abc_projection(projection_id: int) -> dict[str, Any]:
+    record = storage.get_curva_abc_projection(projection_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Curva ABC nao encontrada.")
+    return record
+
+
+@app.put("/api/gerencial/curva-abc/projections/{projection_id}")
+async def update_curva_abc_projection(projection_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    nome, payload = _validate_projection_body(body)
+    empresa, periodo_ini, periodo_fim, modo, total_clientes, total_valor = _curva_abc_listing_fields(payload)
+    record = storage.update_curva_abc_projection(
+        projection_id, nome, empresa, periodo_ini, periodo_fim, modo, total_clientes, total_valor, payload
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Curva ABC nao encontrada.")
+    return record
+
+
+@app.delete("/api/gerencial/curva-abc/projections/{projection_id}")
+async def delete_curva_abc_projection(projection_id: int) -> dict[str, Any]:
+    if not storage.delete_curva_abc_projection(projection_id):
+        raise HTTPException(status_code=404, detail="Curva ABC nao encontrada.")
+    return {"deleted": True}
+
+
+@app.post("/api/gerencial/projections")
+async def create_projection(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    nome, payload = _validate_projection_body(body)
+    empresa, cnpj = _listing_fields_from_payload(payload)
+    return storage.save_projection(nome, empresa, cnpj, payload)
+
+
+@app.get("/api/gerencial/projections")
+async def list_projections() -> dict[str, Any]:
+    return {"projections": storage.list_projections()}
+
+
+@app.get("/api/gerencial/projections/{projection_id}")
+async def get_projection(projection_id: int) -> dict[str, Any]:
+    record = storage.get_projection(projection_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Projecao nao encontrada.")
+    return record
+
+
+@app.put("/api/gerencial/projections/{projection_id}")
+async def update_projection(projection_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    nome, payload = _validate_projection_body(body)
+    empresa, cnpj = _listing_fields_from_payload(payload)
+    record = storage.update_projection(projection_id, nome, empresa, cnpj, payload)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Projecao nao encontrada.")
+    return record
+
+
+@app.delete("/api/gerencial/projections/{projection_id}")
+async def delete_projection(projection_id: int) -> dict[str, Any]:
+    if not storage.delete_projection(projection_id):
+        raise HTTPException(status_code=404, detail="Projecao nao encontrada.")
+    return {"deleted": True}
+
+
+def _validate_projection_body(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    nome = str(body.get("nome") or "").strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="Campo `nome` e obrigatorio.")
+    payload = body.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Campo `payload` deve ser objeto.")
+    return nome, payload
+
+
+def _listing_fields_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    scenario = payload.get("scenario") if isinstance(payload.get("scenario"), dict) else {}
+    dre = scenario.get("dre") if isinstance(scenario.get("dre"), dict) else {}
+    return str(dre.get("empresa") or ""), str(dre.get("cnpj") or "")
+
+
+def _curva_abc_listing_fields(payload: dict[str, Any]) -> tuple[str, str, str, str, int, float]:
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    clientes = payload.get("clientes") if isinstance(payload.get("clientes"), list) else []
+    return (
+        str(meta.get("empresa") or ""),
+        str(meta.get("periodo_ini") or ""),
+        str(meta.get("periodo_fim") or ""),
+        str(meta.get("modo") or ""),
+        len(clientes),
+        sum(float(c.get("valor") or 0) for c in clientes if isinstance(c, dict)),
+    )
+
+
 def _project_payload(payload: dict[str, Any]) -> dict[str, Any]:
     dre = payload.get("dre")
     if not isinstance(dre, dict):
@@ -213,27 +416,61 @@ def _project_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return project_all(dre, balanco, params)
 
 
-def _render_pdf(tipo: str, dre_data: dict[str, Any], balanco_data: dict[str, Any]) -> bytes:
-    from jacom_layout import gerar_balanco_jacom, gerar_dre_jacom
+def _render_pdf(
+    tipo: str, dre_data: dict[str, Any], balanco_data: dict[str, Any], layout: str = "jacom"
+) -> bytes:
+    from jacom_layout import gerar_balanco, gerar_dre
 
     with TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         if tipo == "dre":
             out = tmpdir / "dre.pdf"
-            gerar_dre_jacom(dre_data, str(out), gerencial=True)
+            gerar_dre(dre_data, str(out), layout=layout, gerencial=True)
             return out.read_bytes()
         if tipo == "balanco":
             out = tmpdir / "balanco.pdf"
-            gerar_balanco_jacom(balanco_data, str(out), gerencial=True)
+            gerar_balanco(balanco_data, str(out), layout=layout, gerencial=True)
             return out.read_bytes()
 
         dre_out = tmpdir / "dre.pdf"
         bal_out = tmpdir / "balanco.pdf"
         final_out = tmpdir / "demonstracoes.pdf"
-        gerar_dre_jacom(dre_data, str(dre_out), gerencial=True)
-        gerar_balanco_jacom(balanco_data, str(bal_out), gerencial=True)
+        gerar_dre(dre_data, str(dre_out), layout=layout, gerencial=True)
+        gerar_balanco(balanco_data, str(bal_out), layout=layout, gerencial=True)
         _merge_pdfs([dre_out, bal_out], final_out)
         return final_out.read_bytes()
+
+
+def _render_curva_abc_pdf(
+    clientes: list[dict[str, Any]],
+    periodo_ini: str,
+    periodo_fim: str,
+    empresa: str,
+    versao_gerencial: bool,
+    data_emissao: str | None,
+) -> tuple[bytes, int]:
+    from curva_abc_gerador import gerar_curva_abc, validar_colisoes
+
+    with TemporaryDirectory() as tmp:
+        out = Path(tmp) / "curva_abc.pdf"
+        gerar_curva_abc(
+            clientes=clientes,
+            periodo_ini=periodo_ini,
+            periodo_fim=periodo_fim,
+            empresa=empresa,
+            output_path=str(out),
+            versao_gerencial=versao_gerencial,
+            data_emissao=data_emissao,
+        )
+
+        try:
+            n_colisoes = len(validar_colisoes(str(out)))
+        except Exception:
+            # Defense-in-depth QA check, not a hard requirement (e.g. poppler
+            # missing on some future deploy target) - never let it block delivery.
+            n_colisoes = -1
+
+        return out.read_bytes(), n_colisoes
 
 
 def _merge_pdfs(inputs: list[Path], output: Path) -> None:
@@ -249,10 +486,33 @@ def _merge_pdfs(inputs: list[Path], output: Path) -> None:
 
 
 def _params_from_extraction(dre: dict[str, Any]) -> dict[str, Any]:
-    from gerencial.projection_engine import DRE_RECEITA_FIELDS
+    from gerencial.projection_engine import calculate_dre_totals, normalize_dre
 
-    rb = sum(float(dre.get(field, 0) or 0) for field in DRE_RECEITA_FIELDS)
-    params = ScenarioParams(receita_bruta_alvo=rb).__dict__
+    totals = calculate_dre_totals(normalize_dre(dre))
+    rb = totals["receita_bruta"]
+    defaults = ScenarioParams()
+
+    # Default the rate-based params to the company's own extracted figures
+    # (same approach as the "estimar por faturamento" flow) so a scenario
+    # nobody has touched yet reproduces the real DRE instead of silently
+    # applying the dataclass' generic assumptions.
+    aliquota_deducoes_pct = totals["deducoes"] / rb if rb > 0 else defaults.aliquota_deducoes_pct
+    before_tax = totals["resultado_antes_ir_csl"]
+    provisoes_ir_csl_pct = (
+        totals["provisoes"] / before_tax if before_tax > 0 else defaults.provisoes_ir_csl_pct
+    )
+
+    params = ScenarioParams(
+        # No target/reduction is active yet, mirroring "estimar por
+        # faturamento": the user opts into a hypothetical scenario by moving
+        # a slider, instead of one being silently applied from the first render.
+        meta_lucro_pct=0.0,
+        receita_bruta_alvo=rb,
+        aliquota_deducoes_pct=aliquota_deducoes_pct,
+        reducao_cmv_pct=0.0,
+        reducao_despesas_pct=0.0,
+        provisoes_ir_csl_pct=provisoes_ir_csl_pct,
+    ).__dict__
     return params
 
 
