@@ -359,6 +359,10 @@ async function extractGraphics(page) {
   return { coloredRects, horizontalRules };
 }
 
+function isNearWhite(color) {
+  return color.r > 0.99 && color.g > 0.99 && color.b > 0.99;
+}
+
 function findBgColor(item, coloredRects) {
   const boxY = Number.isFinite(item.boxY) ? item.boxY : item.y;
   const boxH = Number.isFinite(item.boxH) ? item.boxH : item.h;
@@ -379,7 +383,7 @@ function findBgColor(item, coloredRects) {
     }
   }
 
-  if (!best || (best.color.r > 0.99 && best.color.g > 0.99 && best.color.b > 0.99)) return null;
+  if (!best || isNearWhite(best.color)) return null;
   return best;
 }
 
@@ -387,7 +391,7 @@ function overlapLength(aStart, aEnd, bStart, bEnd) {
   return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
 }
 
-function findUnderline(item, horizontalRules) {
+function findUnderline(item, horizontalRules, claimed) {
   const itemLeft = item.x;
   const itemRight = item.x + item.w;
   const baselineY = item.y;
@@ -419,6 +423,10 @@ function findUnderline(item, horizontalRules) {
   }
 
   if (!best) return null;
+  // Mark the original array entry as claimed before copying its fields out —
+  // callers use this to know which horizontalRules are still "unclaimed" and
+  // can be surfaced as standalone movable shapes.
+  claimed?.add(best);
   return {
     x: best.x,
     y: best.y,
@@ -504,6 +512,7 @@ export async function extractTextFromBuffer(pdfBuffer) {
       extractGraphics(page),
     ]);
     const { coloredRects, horizontalRules } = graphics;
+    const usedRules = new Set();
 
     const items = [];
     for (const item of textContent.items) {
@@ -530,7 +539,7 @@ export async function extractTextFromBuffer(pdfBuffer) {
         textAlign: looksLikeNumericValue(item.str) ? 'right' : 'left',
       };
       const bgResult = findBgColor(partial, coloredRects);
-      const underline = findUnderline(partial, horizontalRules);
+      const underline = findUnderline(partial, horizontalRules, usedRules);
 
       items.push({
         ...partial,
@@ -542,12 +551,22 @@ export async function extractTextFromBuffer(pdfBuffer) {
       });
     }
 
+    // Bars/rules never claimed as a text item's underline are standalone
+    // vector shapes the user can select and move independently of any text.
+    // Near-white ones are excluded — invisible on a white page background,
+    // they're either irrelevant or (after a prior move) the white "erase"
+    // rectangle left behind at a shape's old position, not a real bar.
+    const shapes = horizontalRules
+      .filter((rule) => !usedRules.has(rule) && !isNearWhite(rule.color))
+      .map((rule) => ({ x: rule.x, y: rule.y, w: rule.w, h: rule.h, color: cloneColor(rule.color) }));
+
     totalItems += items.length;
     pages.push({
       pageIndex,
       width: viewport.width,
       height: viewport.height,
       items,
+      shapes,
     });
 
     page.cleanup();

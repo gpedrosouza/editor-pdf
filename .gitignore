@@ -40,3 +40,10 @@ Thumbs.db
 # Obsidian vault
 .obsidian/
 VAULT.md
+
+# Gerencial persistence (local SQLite DB)
+gerencial/data/
+
+# Local backup archives (not project source)
+*.rar
+*.zip

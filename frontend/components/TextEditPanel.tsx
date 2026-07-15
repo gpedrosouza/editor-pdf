@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
-import { Edit, TextAlign } from "@/lib/api";
+import { Edit, PlacedImage, ShapeEdit, TextAlign } from "@/lib/api";
 
 interface Props {
   selectedItems: Edit[];
@@ -15,6 +15,11 @@ interface Props {
   panelWidth?: number;
   drawerOpen?: boolean;
   onToggleDrawer?: () => void;
+  images: PlacedImage[];
+  onAddImageClick: () => void;
+  onRemoveImage: (id: string) => void;
+  selectedShapes: ShapeEdit[];
+  onRemoveShape: (shape: ShapeEdit) => void;
 }
 
 export default function TextEditPanel({
@@ -29,15 +34,34 @@ export default function TextEditPanel({
   panelWidth = 300,
   drawerOpen = false,
   onToggleDrawer,
+  images,
+  onAddImageClick,
+  onRemoveImage,
+  selectedShapes,
+  onRemoveShape,
 }: Props) {
   const [tooltipOpen, setTooltipOpen] = useState(false);
   const hasItems = selectedItems.length > 0;
-  const applyEnabled = hasItems && !isLoading;
+  const hasImages = images.length > 0;
+  const hasShapes = selectedShapes.length > 0;
+  const applyEnabled = (hasItems || hasImages || hasShapes) && !isLoading;
 
-  const sharedBodyProps = { hasItems, selectedItems, onRemove, onChangeNewText };
+  const sharedBodyProps = {
+    hasItems,
+    selectedItems,
+    onRemove,
+    onChangeNewText,
+    images,
+    onAddImageClick,
+    onRemoveImage,
+    hasShapes,
+    selectedShapes,
+    onRemoveShape,
+  };
   const sharedFooterProps = {
     applyEnabled,
     hasItems,
+    hasShapes,
     isLoading,
     selectedItems,
     onSetTextAlign,
@@ -253,30 +277,52 @@ interface BodyProps {
   selectedItems: Edit[];
   onRemove: (edit: Edit) => void;
   onChangeNewText: (edit: Edit, newText: string) => void;
+  images: PlacedImage[];
+  onAddImageClick: () => void;
+  onRemoveImage: (id: string) => void;
+  hasShapes: boolean;
+  selectedShapes: ShapeEdit[];
+  onRemoveShape: (shape: ShapeEdit) => void;
 }
 
-function PanelBody({ hasItems, selectedItems, onRemove, onChangeNewText }: BodyProps) {
+function PanelBody({
+  hasItems,
+  selectedItems,
+  onRemove,
+  onChangeNewText,
+  images,
+  onAddImageClick,
+  onRemoveImage,
+  hasShapes,
+  selectedShapes,
+  onRemoveShape,
+}: BodyProps) {
   return (
     <div
       style={{
         flex: 1,
         overflowY: "auto",
-        padding: hasItems ? 12 : 24,
+        padding: 12,
         display: "flex",
         flexDirection: "column",
-        gap: hasItems ? 10 : 0,
-        alignItems: hasItems ? "stretch" : "center",
-        justifyContent: hasItems ? "flex-start" : "center",
+        gap: 10,
       }}
     >
-      {!hasItems ? (
+      <ImagesSection images={images} onAddImageClick={onAddImageClick} onRemoveImage={onRemoveImage} />
+
+      {hasShapes && <ShapesSection shapes={selectedShapes} onRemoveShape={onRemoveShape} />}
+
+      {!hasItems && !hasShapes ? (
         <div
           style={{
+            flex: 1,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
+            justifyContent: "center",
             gap: 10,
             textAlign: "center",
+            padding: "12px 0",
           }}
         >
           <CursorTextIcon />
@@ -289,7 +335,7 @@ function PanelBody({ hasItems, selectedItems, onRemove, onChangeNewText }: BodyP
               margin: 0,
             }}
           >
-            Clique em qualquer texto do PDF para editá-lo
+            Clique em qualquer texto do PDF para editá-lo, movê-lo ou redimensioná-lo
           </p>
         </div>
       ) : (
@@ -306,11 +352,174 @@ function PanelBody({ hasItems, selectedItems, onRemove, onChangeNewText }: BodyP
   );
 }
 
+// ── ImagesSection ────────────────────────────────────────────────────────────
+
+function ImagesSection({
+  images,
+  onAddImageClick,
+  onRemoveImage,
+}: {
+  images: PlacedImage[];
+  onAddImageClick: () => void;
+  onRemoveImage: (id: string) => void;
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 11, color: "#6e7391", flex: 1 }}>Imagens</span>
+        <button
+          onClick={onAddImageClick}
+          style={{
+            height: 26,
+            border: "0.5px solid #2a2d3a",
+            borderRadius: 6,
+            background: "transparent",
+            color: "#9ea3b8",
+            fontSize: 11,
+            display: "flex",
+            alignItems: "center",
+            gap: 5,
+            padding: "0 8px",
+            cursor: "pointer",
+          }}
+        >
+          <PlusIcon />
+          Imagem
+        </button>
+      </div>
+
+      {images.map((image) => (
+        <div
+          key={image.id}
+          style={{
+            background: "#1e2130",
+            border: "0.5px solid #2a2d3a",
+            borderRadius: 8,
+            padding: 8,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={image.dataUrl}
+            alt=""
+            style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 4, flexShrink: 0 }}
+          />
+          <span
+            style={{
+              background: "#6366F1",
+              color: "#fff",
+              fontSize: 9,
+              fontWeight: 600,
+              borderRadius: 4,
+              padding: "2px 5px",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            Pág. {image.pageIndex + 1}
+          </span>
+          <span style={{ flex: 1 }} />
+          <button
+            onClick={() => onRemoveImage(image.id)}
+            style={{
+              background: "none",
+              border: "none",
+              padding: "2px 4px",
+              cursor: "pointer",
+              color: "#4a4e63",
+              lineHeight: 0,
+              flexShrink: 0,
+            }}
+            aria-label="Remover imagem"
+          >
+            <XIcon />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── ShapesSection ────────────────────────────────────────────────────────────
+
+function ShapesSection({
+  shapes,
+  onRemoveShape,
+}: {
+  shapes: ShapeEdit[];
+  onRemoveShape: (shape: ShapeEdit) => void;
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+      <span style={{ fontSize: 11, color: "#6e7391" }}>Formas</span>
+
+      {shapes.map((shape) => (
+        <div
+          key={`${shape.pageIndex}-${shape.x}-${shape.y}`}
+          style={{
+            background: "#1e2130",
+            border: "0.5px solid #2a2d3a",
+            borderRadius: 8,
+            padding: 8,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <div
+            style={{
+              width: 32,
+              height: 8,
+              borderRadius: 2,
+              background: `rgb(${Math.round(shape.color.r * 255)}, ${Math.round(shape.color.g * 255)}, ${Math.round(shape.color.b * 255)})`,
+              flexShrink: 0,
+            }}
+          />
+          <span
+            style={{
+              background: "#6366F1",
+              color: "#fff",
+              fontSize: 9,
+              fontWeight: 600,
+              borderRadius: 4,
+              padding: "2px 5px",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            Pág. {shape.pageIndex + 1}
+          </span>
+          <span style={{ flex: 1 }} />
+          <button
+            onClick={() => onRemoveShape(shape)}
+            style={{
+              background: "none",
+              border: "none",
+              padding: "2px 4px",
+              cursor: "pointer",
+              color: "#4a4e63",
+              lineHeight: 0,
+              flexShrink: 0,
+            }}
+            aria-label="Remover forma"
+          >
+            <XIcon />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── PanelFooter ────────────────────────────────────────────────────────────────
 
 interface FooterProps {
   applyEnabled: boolean;
   hasItems: boolean;
+  hasShapes: boolean;
   isLoading: boolean;
   selectedItems: Edit[];
   onSetTextAlign: (align: TextAlign) => void;
@@ -321,6 +530,7 @@ interface FooterProps {
 function PanelFooter({
   applyEnabled,
   hasItems,
+  hasShapes,
   isLoading,
   selectedItems,
   onSetTextAlign,
@@ -328,6 +538,7 @@ function PanelFooter({
   onClearAll,
 }: FooterProps) {
   const activeAlign = getActiveAlign(selectedItems);
+  const hasClearable = hasItems || hasShapes;
 
   return (
     <div
@@ -396,8 +607,8 @@ function PanelFooter({
       </button>
 
       <button
-        onClick={hasItems && !isLoading ? onClearAll : undefined}
-        disabled={!hasItems || isLoading}
+        onClick={hasClearable && !isLoading ? onClearAll : undefined}
+        disabled={!hasClearable || isLoading}
         style={{
           background: "transparent",
           color: "#9ea3b8",
@@ -406,8 +617,8 @@ function PanelFooter({
           padding: 10,
           fontSize: 12,
           width: "100%",
-          cursor: hasItems && !isLoading ? "pointer" : "not-allowed",
-          opacity: hasItems && !isLoading ? 1 : 0.45,
+          cursor: hasClearable && !isLoading ? "pointer" : "not-allowed",
+          opacity: hasClearable && !isLoading ? 1 : 0.45,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -741,6 +952,23 @@ function RefreshIcon() {
     >
       <polyline points="23 4 23 10 17 10" />
       <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+    >
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
     </svg>
   );
 }

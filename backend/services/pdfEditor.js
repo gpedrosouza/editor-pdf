@@ -6,14 +6,14 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 const COVER_MARGIN = 1;
 const BACKGROUND_EDGE_INSET = 0.5;
 
-export async function applyEdits(pdfBuffer, edits) {
+export async function applyEdits(pdfBuffer, edits, images = [], shapeEdits = []) {
   const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
   doc.registerFontkit(fontkit);
   const pages = doc.getPages();
   const fonts = await loadFonts(doc);
 
   for (const edit of edits) {
-    const { pageIndex, y, fontSize, newText, bgColor } = edit;
+    const { pageIndex, newText, bgColor } = edit;
 
     if (pageIndex < 0 || pageIndex >= pages.length) {
       throw new EditError(`pageIndex ${pageIndex} is out of range (document has ${pages.length} page(s))`);
@@ -22,8 +22,11 @@ export async function applyEdits(pdfBuffer, edits) {
     const page = pages[pageIndex];
     const font = pickFont(edit, fonts);
     const text = newText ?? '';
-    const textWidth = font.widthOfTextAtSize(text, fontSize);
-    const drawX = getDrawX(edit, font, text);
+    const target = resolveTarget(edit);
+    const textWidth = font.widthOfTextAtSize(text, target.fontSize);
+    const drawX = getDrawX(edit, target, font, text);
+    // The cover rect always erases the ORIGINAL position/decoration, never the
+    // target — that's what makes "move the text elsewhere" work at all.
     const cover = getCoverBounds(edit);
     const coverColor = toPdfColor(bgColor, rgb(1, 1, 1));
 
@@ -39,27 +42,144 @@ export async function applyEdits(pdfBuffer, edits) {
     if (text.length > 0) {
       page.drawText(text, {
         x: drawX,
-        y,
-        size: fontSize,
+        y: target.y,
+        size: target.fontSize,
         font,
         color: rgb(0, 0, 0),
       });
     }
 
-    const underline = getReplacementUnderline(edit, drawX, textWidth);
-    if (underline) {
-      page.drawRectangle({
-        x: underline.x,
-        y: underline.y,
-        width: underline.w,
-        height: underline.h,
-        color: toPdfColor(underline.color, rgb(0, 0, 0)),
-        opacity: 1,
-      });
+    // An underline is a property of the original row, not of the glyph — moved
+    // text has no principled place to synthesize one, so it's simply erased
+    // (by the cover rect above) rather than redrawn at the new position.
+    if (!edit.transform) {
+      const underline = getReplacementUnderline(edit, drawX, textWidth);
+      if (underline) {
+        page.drawRectangle({
+          x: underline.x,
+          y: underline.y,
+          width: underline.w,
+          height: underline.h,
+          color: toPdfColor(underline.color, rgb(0, 0, 0)),
+          opacity: 1,
+        });
+      }
     }
   }
 
+  // Existing vector shapes (bars/rules) being repositioned — same
+  // erase-original/redraw-at-target two-step as text, but a plain rectangle
+  // since a shape has no baseline/font concept.
+  for (const shapeEdit of shapeEdits) {
+    const { pageIndex, color } = shapeEdit;
+
+    if (pageIndex < 0 || pageIndex >= pages.length) {
+      throw new EditError(
+        `shapeEdits pageIndex ${pageIndex} is out of range (document has ${pages.length} page(s))`
+      );
+    }
+
+    const page = pages[pageIndex];
+    const target = resolveShapeTarget(shapeEdit);
+
+    // Erase the ORIGINAL box in white — same fallback already used for
+    // text's cover-rect when no background is known. Known limitation: a
+    // shape sitting on a non-white background leaves a visible white patch,
+    // since there's no "what's behind this bar" detection.
+    page.drawRectangle({
+      x: shapeEdit.x,
+      y: shapeEdit.y,
+      width: shapeEdit.w,
+      height: shapeEdit.h,
+      color: rgb(1, 1, 1),
+      opacity: 1,
+    });
+
+    page.drawRectangle({
+      x: target.x,
+      y: target.y,
+      width: target.w,
+      height: target.h,
+      color: toPdfColor(color, rgb(0, 0, 0)),
+      opacity: 1,
+    });
+  }
+
+  // Drawn after every edit/shape, so inserted images always render on top.
+  for (const image of images) {
+    if (image.pageIndex < 0 || image.pageIndex >= pages.length) {
+      throw new EditError(
+        `images pageIndex ${image.pageIndex} is out of range (document has ${pages.length} page(s))`
+      );
+    }
+    const embedded = await embedImageFromDataUrl(doc, image.dataUrl);
+    pages[image.pageIndex].drawImage(embedded, {
+      x: image.x,
+      y: image.y,
+      width: image.w,
+      height: image.h,
+    });
+  }
+
   return doc.save();
+}
+
+// Resolves the box/baseline/fontSize actually used for drawing. Untouched
+// edits (no transform) resolve to their original values byte-for-byte.
+//
+// boxY = baselineY + descent*fontSize (descent is a negative fraction of
+// fontSize), so baselineOffset := edit.y - boxY scales linearly with
+// fontSize. A pure move (fontSize unchanged) keeps that offset as-is; a
+// resize must scale it by the same ratio the font grew/shrank by, or the
+// text ends up subtly off its baseline.
+function resolveTarget(edit) {
+  if (!edit.transform) {
+    return { x: edit.x, y: edit.y, w: edit.w, fontSize: edit.fontSize };
+  }
+  const originalBoxY = getTextBox(edit).y;
+  const baselineOffset = edit.y - originalBoxY;
+  const ratio = edit.transform.fontSize / edit.fontSize;
+  return {
+    x: edit.transform.x,
+    y: edit.transform.boxY + baselineOffset * ratio,
+    w: edit.transform.w,
+    fontSize: edit.transform.fontSize,
+  };
+}
+
+// Resolves the box actually used for drawing a shape. Untouched shapeEdits
+// (no transform) resolve to their original box byte-for-byte — a shape's
+// (x,y) already IS its box origin, unlike text's baseline-relative y.
+function resolveShapeTarget(shapeEdit) {
+  if (!shapeEdit.transform) {
+    return { x: shapeEdit.x, y: shapeEdit.y, w: shapeEdit.w, h: shapeEdit.h };
+  }
+  return {
+    x: shapeEdit.transform.x,
+    y: shapeEdit.transform.y,
+    w: shapeEdit.transform.w,
+    h: shapeEdit.transform.h,
+  };
+}
+
+async function embedImageFromDataUrl(doc, dataUrl) {
+  const match = /^data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl || '');
+  if (!match) throw new EditError('Invalid image data URL');
+  // Buffer.from() on small inputs allocates from Node's shared pool, so
+  // `.buffer` can be a much larger, offset ArrayBuffer than the data itself.
+  // pdf-lib's embedders read `imageData.buffer` directly (ignoring
+  // byteOffset), so a pooled buffer can leak bytes from a previously
+  // embedded image. Copying into a fresh, exactly-sized Uint8Array avoids it.
+  const bytes = new Uint8Array(Buffer.from(match[1], 'base64'));
+
+  // Sniff the actual magic bytes rather than trusting the declared mime type.
+  const isPng =
+    bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+
+  if (isPng) return doc.embedPng(bytes);
+  if (isJpeg) return doc.embedJpg(bytes);
+  throw new EditError('Unsupported image format - only PNG and JPEG are supported');
 }
 
 async function loadFonts(doc) {
@@ -121,12 +241,12 @@ function findSystemFontPath(fileNames) {
   return null;
 }
 
-function getDrawX(edit, font, text) {
-  const textWidth = font.widthOfTextAtSize(text ?? '', edit.fontSize);
+function getDrawX(edit, target, font, text) {
+  const textWidth = font.widthOfTextAtSize(text ?? '', target.fontSize);
   if (resolveTextAlign(edit) === 'right') {
-    return edit.x + edit.w - textWidth;
+    return target.x + target.w - textWidth;
   }
-  return edit.x;
+  return target.x;
 }
 
 function getCoverBounds(edit) {
