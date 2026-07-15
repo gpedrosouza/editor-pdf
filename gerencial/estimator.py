@@ -346,10 +346,24 @@ def _default_params_from_estimate(dre_totals: dict[str, float], faturamento: flo
     }
 
 
+BONIF_AMOSTRAS_JITTER_PCT = 0.045
+
+
 def _apply_industry_financial_revenue_defaults(dre: dict[str, Any], faturamento: float) -> None:
     for field, pct in INDUSTRY_FINANCIAL_REVENUE_MIN_PCTS.items():
         if abs(float(dre.get(field, 0) or 0)) < 1e-9:
             dre[field] = faturamento * pct
+
+    # A planilha benchmark crava 0,10% fixo para "bonif_amostras", o que
+    # sempre resulta num percentual redondo demais no DRE. Desloca uma
+    # fatia dela para cima e tira o mesmo valor de "descontos_fin",
+    # preservando o total das duas contas.
+    bonif = dre.get("bonif_amostras", 0.0)
+    descontos_fin = dre.get("descontos_fin", 0.0)
+    if bonif > 0 and descontos_fin > 0:
+        delta = min(bonif * BONIF_AMOSTRAS_JITTER_PCT, descontos_fin)
+        dre["bonif_amostras"] = bonif + delta
+        dre["descontos_fin"] = descontos_fin - delta
 
 
 def _number(value: Any) -> float:

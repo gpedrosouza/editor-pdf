@@ -1,32 +1,35 @@
 """
 jacom_layout.py
 ===============
-Reconstrói o layout visual do sistema JACOM a partir de texto extraído de PDF.
+Gera os relatorios gerenciais (DRE e Balanco) a partir de um dicionario de
+valores, em um de tres layouts visuais possiveis:
 
-O sistema JACOM (Jacom Inteligência Contábil Ltda) gera PDFs com estrutura
-consistente. Este módulo replica esse layout usando ReportLab para gerar
-documentos gerenciais no mesmo padrão visual.
+  - "jacom"   Replica o layout visual original do sistema JACOM.
+  - "moderno" Extrato gerencial: sans-serif, acento verde-petroleo, tira de
+              KPIs no topo e coluna de analise vertical (% da base).
+  - "formal"  Relatorio patrimonial: serifado, acento bordo, codigos de
+              plano de contas por linha.
 
-Estrutura do layout JACOM:
-  - Cabeçalho: empresa (esq), Folha N (dir), CNPJ (esq), livro (dir), período
-  - Título centralizado do documento
-  - Colunas: Descrição (esq) | Saldo Parcial (centro-dir) | Saldo Total (dir)
-  - Seções em negrito sem recuo
-  - Subcontas com 1 nível de recuo (sem fundo diferenciado)
-  - Valores negativos entre parênteses: (1.234,56)
-  - Totalizadores em negrito na coluna Saldo Total
-  - Rodapé: cidade, data, assinaturas (empresário + contador CRC)
-  - Marca d'água: "VERSÃO GERENCIAL INTERNA" para documentos gerenciais
+Arquitetura: a lista de linhas (`Linha`) e' construida uma unica vez a partir
+de `dados` (`montar_linhas_dre` / `montar_linhas_balanco`), independente do
+layout escolhido. Cada layout e' apenas uma forma diferente de desenhar essa
+mesma lista (`JacomPDF`, `ModernoPDF`, `FormalPDF`), todas derivadas de
+`_BaseGerencialPDF`.
+
+Estrutura comum a todo layout:
+  - Cabecalho: empresa, CNPJ, periodo, folha/livro, titulo do documento
+  - Colunas: Descricao | (opcional) analise | Saldo
+  - Valores negativos entre parenteses (DRE) ou sufixo D/C (Balanco)
+  - Totalizadores em destaque
+  - Rodape: cidade, data, assinaturas (empresario + contador CRC)
 """
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas as rl_canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional
 from datetime import date, datetime
 
 
@@ -51,6 +54,8 @@ SZ_TITL = 9.5                 # tamanho fonte título
 # Temporariamente desabilitado para testar o uso em um sistema contabil oficial.
 # Para reativar, altere para True.
 EXIBIR_MARCAS_GERENCIAIS = False
+
+LAYOUTS_DISPONIVEIS = ("jacom", "moderno", "formal")
 
 MESES_PT = [
     "",
@@ -117,26 +122,13 @@ class Linha:
     sufixo_dc: bool = False            # adicionar D/C (balanço)
 
 
-# ── Gerador principal ─────────────────────────────────────────────────────────
-class JacomPDF:
+# ════════════════════════════════════════════════════════════════════════════
+#  RENDERIZADOR BASE — estado e mecanica compartilhados por todo layout
+# ════════════════════════════════════════════════════════════════════════════
+class _BaseGerencialPDF:
     """
-    Gera PDF no padrão visual JACOM.
-    
-    Uso:
-        pdf = JacomPDF("saida.pdf", tipo="DRE")
-        pdf.set_empresa("EMPRESA LTDA", "00.000.000/0001-00",
-                        "01/01/2025", "31/12/2025")
-        pdf.set_modo_gerencial(True)  # adiciona marca d'água e aviso
-        
-        linhas = [
-            Linha("RECEITA BRUTA", negrito=True),
-            Linha("  Venda de Produtos", parcial=100000.0),
-            Linha("  Servicos Prestados", parcial=50000.0, total=150000.0),
-            Linha(""),  # separador
-            Linha("LUCRO BRUTO", total=50000.0, negrito=True),
-        ]
-        pdf.gerar(linhas)
-        pdf.salvar()
+    Mecanica comum aos 3 layouts: paginacao, dados da empresa, assinaturas.
+    Cada layout implementa apenas `_cabecalho`, `_rodape` e `_linha`.
     """
 
     def __init__(self, output_path: str, tipo: str = "DRE"):
@@ -166,6 +158,9 @@ class JacomPDF:
         # Modo gerencial
         self.gerencial = False
 
+        # Valor de referencia para colunas de analise vertical (% da base)
+        self.base_pct = None
+
     def set_empresa(self, nome: str, cnpj: str,
                     data_ini: str, data_fim: str,
                     cidade: str = "CAMPO LIMPO PAULISTA"):
@@ -191,7 +186,11 @@ class JacomPDF:
     def set_modo_gerencial(self, ativo: bool = True):
         self.gerencial = ativo
 
-    # ── Componentes visuais ──────────────────────────────────────────────────
+    def set_base_pct(self, valor: Optional[float]):
+        """Valor de referencia (receita bruta / ativo total) para % por linha."""
+        self.base_pct = valor
+
+    # ── Componentes visuais compartilhados ───────────────────────────────────
 
     def _watermark(self):
         if not self.gerencial or not EXIBIR_MARCAS_GERENCIAIS:
@@ -205,6 +204,70 @@ class JacomPDF:
         self.c.drawCentredString(0, 20, "VERSÃO GERENCIAL")
         self.c.drawCentredString(0, -30, "INTERNA")
         self.c.restoreState()
+
+    def _cabecalho(self):
+        raise NotImplementedError
+
+    def _rodape(self, ultima_pagina: bool = False):
+        raise NotImplementedError
+
+    def _linha(self, l: "Linha", is_last: bool = False):
+        raise NotImplementedError
+
+    def _nova_pagina(self, ultima: bool = False):
+        self._rodape(ultima_pagina=ultima)
+        self.c.showPage()
+        self.pagina += 1
+        self._watermark()
+        self._cabecalho()
+
+    def _checar_pagina(self, h_necessaria: float = LH_NORM):
+        """Quebra de página automática."""
+        if self.y - h_necessaria < MAR_B + 25 * mm:
+            self._nova_pagina()
+
+    # ── Interface principal ──────────────────────────────────────────────────
+
+    def gerar(self, linhas: List[Linha]):
+        """Gera o documento a partir de uma lista de Linha."""
+        self._watermark()
+        self._cabecalho()
+
+        n = len(linhas)
+        for i, l in enumerate(linhas):
+            self._linha(l, is_last=(i == n - 1))
+
+        # Última página: rodapé com assinaturas
+        self._rodape(ultima_pagina=True)
+
+    def salvar(self):
+        self.c.save()
+        return self.output_path
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LAYOUT "jacom" — visual original do sistema JACOM
+# ════════════════════════════════════════════════════════════════════════════
+class JacomPDF(_BaseGerencialPDF):
+    """
+    Gera PDF no padrão visual JACOM.
+
+    Uso:
+        pdf = JacomPDF("saida.pdf", tipo="DRE")
+        pdf.set_empresa("EMPRESA LTDA", "00.000.000/0001-00",
+                        "01/01/2025", "31/12/2025")
+        pdf.set_modo_gerencial(True)  # adiciona marca d'água e aviso
+
+        linhas = [
+            Linha("RECEITA BRUTA", negrito=True),
+            Linha("  Venda de Produtos", parcial=100000.0),
+            Linha("  Servicos Prestados", parcial=50000.0, total=150000.0),
+            Linha(""),  # separador
+            Linha("LUCRO BRUTO", total=50000.0, negrito=True),
+        ]
+        pdf.gerar(linhas)
+        pdf.salvar()
+    """
 
     def _cabecalho(self):
         """Replica o cabeçalho padrão JACOM."""
@@ -250,16 +313,6 @@ class JacomPDF:
             c.drawCentredString(W / 2, y, subtit)
             y -= 4 * mm
 
-        # Aviso gerencial temporariamente desabilitado.
-        # if self.gerencial and EXIBIR_MARCAS_GERENCIAIS:
-        if False:
-            c.setFont(FONT_B, 7.5)
-            c.setFillColor(colors.HexColor("#C05C00"))
-            c.drawCentredString(W / 2, y,
-                "VERSÃO GERENCIAL INTERNA — Documento não oficial, sem valor contábil ou legal")
-            c.setFillColor(colors.black)
-            y -= 4 * mm
-
         # Cabeçalho das colunas
         c.setFont(FONT_B, SZ_BODY)
         c.drawString(COL_A, y, "Descrição")
@@ -284,69 +337,39 @@ class JacomPDF:
         c.setFont(FONT, 7.5)
         c.setFillColor(colors.black)
 
-        # Sistema e cidade/data
-        if not ultima_pagina:
-            c.drawString(COL_A, y_rod + 8 * mm,
-                "Sistema licenciado para GR GESTÃO FINANCEIRA LTDA")
-            c.drawRightString(COL_C, y_rod + 8 * mm,
-                f"{self.cidade}, {self.data_emissao}")
-        else:
-            # Última página: assinaturas
-            c.drawString(COL_A, y_rod + 8 * mm,
-                f"{self.cidade}, {self.data_emissao}")
+        # Cidade/data
+        c.drawString(COL_A, y_rod + 8 * mm,
+            f"{self.cidade}, {self.data_emissao}")
 
-            # Rodape gerencial temporariamente desabilitado.
-            # if self.gerencial and EXIBIR_MARCAS_GERENCIAIS:
-            if False:
-                c.setFont(FONT_B, 7)
-                c.setFillColor(colors.HexColor("#C05C00"))
-                c.drawCentredString(W / 2, y_rod,
-                    "Documento gerencial para uso interno exclusivo. "
-                    "Não constitui peça contábil oficial.")
-                c.setFillColor(colors.black)
-            else:
-                # Assinaturas lado a lado
-                cx_e = COL_A + 40 * mm
-                cx_d = COL_C - 40 * mm
-                y_ass = y_rod - 8 * mm
+        if ultima_pagina:
+            # Assinaturas lado a lado
+            cx_e = COL_A + 40 * mm
+            cx_d = COL_C - 40 * mm
+            y_ass = y_rod - 8 * mm
 
-                c.setFont(FONT, 7.5)
-                c.drawCentredString(cx_e, y_ass + 4 * mm,
-                    "_______________________________________")
-                c.drawCentredString(cx_d, y_ass + 4 * mm,
-                    "_______________________________________")
-                c.setFont(FONT_B, 7.5)
-                c.drawCentredString(cx_e, y_ass,
-                    self.empresario_nome or "NOME DO EMPRESÁRIO")
-                c.drawCentredString(cx_d, y_ass,
-                    self.contador_nome or "NOME DO CONTADOR")
-                c.setFont(FONT, 7.5)
-                c.drawCentredString(cx_e, y_ass - 4 * mm, self.empresario_cargo)
-                if self.contador_crc:
-                    c.drawCentredString(cx_d, y_ass - 4 * mm,
-                        f"Reg. no CRC - SP sob o No. {self.contador_crc}")
-                if self.empresario_cpf:
-                    c.drawCentredString(cx_e, y_ass - 8 * mm,
-                        f"CPF: {self.empresario_cpf}")
-                if self.contador_cpf:
-                    c.drawCentredString(cx_d, y_ass - 8 * mm,
-                        f"CPF: {self.contador_cpf}")
+            c.setFont(FONT, 7.5)
+            c.drawCentredString(cx_e, y_ass + 4 * mm,
+                "_______________________________________")
+            c.drawCentredString(cx_d, y_ass + 4 * mm,
+                "_______________________________________")
+            c.setFont(FONT_B, 7.5)
+            c.drawCentredString(cx_e, y_ass,
+                self.empresario_nome or "NOME DO EMPRESÁRIO")
+            c.drawCentredString(cx_d, y_ass,
+                self.contador_nome or "NOME DO CONTADOR")
+            c.setFont(FONT, 7.5)
+            c.drawCentredString(cx_e, y_ass - 4 * mm, self.empresario_cargo)
+            if self.contador_crc:
+                c.drawCentredString(cx_d, y_ass - 4 * mm,
+                    f"Reg. no CRC - SP sob o No. {self.contador_crc}")
+            if self.empresario_cpf:
+                c.drawCentredString(cx_e, y_ass - 8 * mm,
+                    f"CPF: {self.empresario_cpf}")
+            if self.contador_cpf:
+                c.drawCentredString(cx_d, y_ass - 8 * mm,
+                    f"CPF: {self.contador_cpf}")
 
-    def _nova_pagina(self, ultima: bool = False):
-        self._rodape(ultima_pagina=ultima)
-        self.c.showPage()
-        self.pagina += 1
-        self._watermark()
-        self._cabecalho()
-
-    def _checar_pagina(self, h_necessaria: float = LH_NORM):
-        """Quebra de página automática."""
-        if self.y - h_necessaria < MAR_B + 25 * mm:
-            self._nova_pagina()
-
-    # ── Renderização de linhas ───────────────────────────────────────────────
-
-    def _linha(self, l: Linha):
+    def _linha(self, l: Linha, is_last: bool = False):
         """Renderiza uma única linha no padrão JACOM."""
         if l.separador or (not l.descricao and l.parcial is None and l.total is None):
             self.y -= LH_NORM * 0.6
@@ -377,66 +400,377 @@ class JacomPDF:
 
         self.y -= LH_NORM
 
-    # ── Interface principal ──────────────────────────────────────────────────
-
-    def gerar(self, linhas: List[Linha]):
-        """Gera o documento a partir de uma lista de Linha."""
-        self._watermark()
-        self._cabecalho()
-
-        for i, l in enumerate(linhas):
-            self._linha(l)
-
-        # Última página: rodapé com assinaturas
-        self._rodape(ultima_pagina=True)
-
-    def salvar(self):
-        self.c.save()
-        return self.output_path
-
 
 # ════════════════════════════════════════════════════════════════════════════
-#  FUNÇÕES DE CONVENIÊNCIA
+#  LAYOUT "moderno" — "Extrato Gerencial"
 # ════════════════════════════════════════════════════════════════════════════
+class ModernoPDF(_BaseGerencialPDF):
+    """Sans-serif, acento verde-petroleo, KPIs no topo e analise vertical (%)."""
 
-def gerar_dre_jacom(dados: dict, output_path: str,
-                    gerencial: bool = True) -> str:
-    """
-    Gera DRE no padrão JACOM a partir de um dicionário de valores.
-    
-    dados = {
-        'empresa': 'NOME EMPRESA LTDA',
-        'cnpj': '00.000.000/0001-00',
-        'data_ini': '01/01/2025',
-        'data_fim': '31/12/2025',
-        'cidade': 'SAO PAULO',
-        # Receita Bruta
-        'venda_produtos': 6654807.80,
-        'venda_produtos_export': 214654.14,
-        ...
-        # (todos os campos extraídos pelo extrator)
-    }
-    """
-    pdf = JacomPDF(output_path, tipo="DRE")
-    pdf.set_empresa(
-        dados.get('empresa', ''),
-        dados.get('cnpj', ''),
-        dados.get('data_ini', ''),
-        dados.get('data_fim', ''),
-        dados.get('cidade', 'SAO PAULO'),
-    )
-    if dados.get('data_emissao'):
-        pdf.set_data_emissao(dados.get('data_emissao'))
-    pdf.set_modo_gerencial(gerencial)
+    INK = colors.HexColor("#1B2321")
+    MUTED = colors.HexColor("#69766F")
+    ACCENT = colors.HexColor("#0F6D5C")
+    ACCENT_TINT = colors.HexColor("#E9F1EC")
+    NEG = colors.HexColor("#9A3A2E")
+    RULE = colors.HexColor("#D8DED9")
 
-    # Configurar assinaturas (opcional)
-    if dados.get('empresario_nome') or dados.get('contador_nome'):
-        pdf.set_assinaturas(
-            dados['empresario_nome'], dados.get('empresario_cpf', ''),
-            dados.get('contador_nome', ''), dados.get('contador_crc', ''),
-            dados.get('contador_cpf', ''),
-            dados.get('empresario_cargo', 'EMPRESARIO'),
+    def __init__(self, output_path: str, tipo: str = "DRE"):
+        super().__init__(output_path, tipo)
+        self.kpis = []  # list[(label, value_str, kind)]  kind: neutral|accent|neg
+
+    def set_kpis(self, kpis):
+        self.kpis = kpis or []
+
+    def _cabecalho(self):
+        c = self.c
+        y = H - MAR_T
+
+        c.setFont(FONT_B, 13)
+        c.setFillColor(self.INK)
+        c.drawString(COL_A, y, self.empresa)
+        c.setFont(FONT, 8.5)
+        c.setFillColor(self.MUTED)
+        c.drawRightString(COL_C, y, f"Folha {self.pagina:04d}  ·  Livro {self.numero_livro}")
+        y -= 5 * mm
+
+        c.setFont(FONT, 8.5)
+        c.setFillColor(self.MUTED)
+        c.drawString(COL_A, y, f"CNPJ {self.cnpj}   ·   Período {self.data_ini} a {self.data_fim}")
+        y -= 4 * mm
+
+        c.setStrokeColor(self.ACCENT)
+        c.setLineWidth(1.4)
+        c.line(COL_A, y, COL_C, y)
+        y -= 6 * mm
+
+        titulo = "Demonstração do Resultado do Exercício" if self.tipo == "DRE" else "Balanço Patrimonial"
+        c.setFont(FONT_B, 11)
+        c.setFillColor(self.ACCENT)
+        c.drawCentredString(W / 2, y, titulo.upper())
+        y -= 4.5 * mm
+        c.setFont(FONT, 8)
+        c.setFillColor(self.MUTED)
+        subt = f"Exercício encerrado em {self.data_fim}" if self.tipo == "DRE" else f"Posição em {self.data_fim}"
+        c.drawCentredString(W / 2, y, subt)
+        y -= 7 * mm
+
+        if self.kpis:
+            kpi_w = (COL_C - COL_A) / len(self.kpis)
+            for i, (label, value, kind) in enumerate(self.kpis):
+                x0 = COL_A + i * kpi_w
+                pad = 4 * mm if i > 0 else 0
+                if i > 0:
+                    c.setStrokeColor(self.RULE)
+                    c.setLineWidth(0.4)
+                    c.line(x0, y + 2 * mm, x0, y - 6 * mm)
+                c.setFont(FONT, 6.5)
+                c.setFillColor(self.MUTED)
+                c.drawString(x0 + pad, y, label.upper())
+                c.setFont(FONT_B, 10.5)
+                c.setFillColor(self.NEG if kind == "neg" else (self.ACCENT if kind == "accent" else self.INK))
+                c.drawString(x0 + pad, y - 5 * mm, value)
+            y -= 11 * mm
+            c.setStrokeColor(self.RULE)
+            c.setLineWidth(0.4)
+            c.line(COL_A, y, COL_C, y)
+            y -= 4 * mm
+
+        c.setFont(FONT_B, 7.5)
+        c.setFillColor(self.INK)
+        c.drawString(COL_A, y, "DESCRIÇÃO")
+        c.drawRightString(COL_B_R, y, "% RECEITA" if self.tipo == "DRE" else "% ATIVO")
+        c.drawRightString(COL_C, y, "VALOR")
+        y -= 1.5 * mm
+        c.setStrokeColor(self.RULE)
+        c.setLineWidth(0.4)
+        c.line(COL_A, y, COL_C, y)
+        y -= 4 * mm
+
+        self.y = y
+
+    def _rodape(self, ultima_pagina: bool = False):
+        c = self.c
+        y_rod = MAR_B
+
+        c.setStrokeColor(self.RULE)
+        c.setLineWidth(0.4)
+        c.line(COL_A, y_rod + 12 * mm, COL_C, y_rod + 12 * mm)
+
+        c.setFont(FONT, 7.5)
+        c.setFillColor(self.MUTED)
+        c.drawString(COL_A, y_rod + 8 * mm, f"{self.cidade}, {self.data_emissao}")
+        c.drawRightString(COL_C, y_rod + 8 * mm, f"Página {self.pagina}")
+
+        if ultima_pagina:
+            cx_e = COL_A + 40 * mm
+            cx_d = COL_C - 40 * mm
+            y_ass = y_rod - 8 * mm
+
+            c.setStrokeColor(self.INK)
+            c.setLineWidth(0.5)
+            c.line(cx_e - 32 * mm, y_ass + 4 * mm, cx_e + 32 * mm, y_ass + 4 * mm)
+            c.line(cx_d - 32 * mm, y_ass + 4 * mm, cx_d + 32 * mm, y_ass + 4 * mm)
+            c.setFont(FONT_B, 8.5)
+            c.setFillColor(self.INK)
+            c.drawCentredString(cx_e, y_ass, self.empresario_nome or "NOME DO EMPRESÁRIO")
+            c.drawCentredString(cx_d, y_ass, self.contador_nome or "NOME DO CONTADOR")
+            c.setFont(FONT, 7.5)
+            c.setFillColor(self.MUTED)
+            c.drawCentredString(cx_e, y_ass - 4 * mm, self.empresario_cargo)
+            if self.contador_crc:
+                c.drawCentredString(cx_d, y_ass - 4 * mm, f"CRC {self.contador_crc}")
+            if self.empresario_cpf:
+                c.drawCentredString(cx_e, y_ass - 8 * mm, f"CPF {self.empresario_cpf}")
+            if self.contador_cpf:
+                c.drawCentredString(cx_d, y_ass - 8 * mm, f"CPF {self.contador_cpf}")
+
+    def _pct(self, valor: float) -> str:
+        if not self.base_pct:
+            return ""
+        return f"{abs(valor) / self.base_pct * 100:.1f}%"
+
+    def _linha(self, l: Linha, is_last: bool = False):
+        if l.separador or (not l.descricao and l.parcial is None and l.total is None):
+            self.y -= LH_NORM * 0.6
+            return
+
+        self._checar_pagina(LH_NORM + (2 * mm if is_last else 0))
+
+        c = self.c
+        recuo = l.recuo * 4 * mm
+        valor = l.total if l.total is not None else l.parcial
+        # A % sempre reflete o valor proprio da linha (parcial), mesmo quando
+        # a coluna de VALOR mostra o subtotal do grupo que "pega carona" nela.
+        valor_pct = l.parcial if l.parcial is not None else l.total
+        is_total_row = l.negrito and valor is not None
+        row_h = LH_NORM if not is_last else LH_NORM + 2 * mm
+
+        # Na linha final, "bom" (destaque) ou "ruim" (alerta) depende do que o
+        # valor representa: no DRE, prejuizo e' ruim; no Balanco, qualquer
+        # diferenca na verificacao e' ruim (mesmo que o sinal ja tenha virado
+        # magnitude via debit()/credit()).
+        final_ruim = (valor or 0) < 0 if (is_last and not l.sufixo_dc) else (
+            abs(valor or 0) > 0.01 if is_last else False
         )
+        cor_final = self.NEG if final_ruim else self.ACCENT
+
+        if is_total_row and not is_last:
+            c.setFillColor(self.ACCENT_TINT)
+            c.rect(COL_A - 2 * mm, self.y - 1.3 * mm, (COL_C - COL_A) + 4 * mm, LH_NORM,
+                   fill=1, stroke=0)
+
+        font = FONT_B if l.negrito else FONT
+        size = SZ_BODY if not is_last else 11
+        c.setFont(font, size)
+        c.setFillColor(cor_final if is_last else self.INK)
+        c.drawString(COL_A + recuo, self.y, l.descricao)
+
+        if valor is not None:
+            if self.base_pct and not is_last and valor_pct is not None:
+                c.setFont(FONT, 7)
+                c.setFillColor(self.MUTED)
+                c.drawRightString(COL_B_R, self.y, self._pct(valor_pct))
+            txt = fmt_dc(valor) if l.sufixo_dc else fmt_br(valor)
+            c.setFont(font, size)
+            cor = cor_final if is_last else self.INK
+            if valor < 0 and not l.sufixo_dc and not is_last:
+                cor = self.NEG
+            c.setFillColor(cor)
+            c.drawRightString(COL_C, self.y, txt)
+
+        if is_last:
+            c.setStrokeColor(cor_final)
+            c.setLineWidth(1.1)
+            c.line(COL_A, self.y - 2.2 * mm, COL_C, self.y - 2.2 * mm)
+            c.setLineWidth(0.6)
+            c.line(COL_A, self.y - 3.0 * mm, COL_C, self.y - 3.0 * mm)
+
+        self.y -= row_h
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LAYOUT "formal" — "Relatório Patrimonial"
+# ════════════════════════════════════════════════════════════════════════════
+class FormalPDF(_BaseGerencialPDF):
+    """Serifado, acento bordô, códigos de plano de contas por linha."""
+
+    INK = colors.HexColor("#23262E")
+    MUTED = colors.HexColor("#6C6A63")
+    ACCENT = colors.HexColor("#7A2331")
+    RULE = colors.HexColor("#C9C3B5")
+
+    def __init__(self, output_path: str, tipo: str = "DRE"):
+        super().__init__(output_path, tipo)
+        self._sec_num = 0
+        self._item_num = 0
+        self._codigo_prefixo_atual = None
+
+    def _cabecalho(self):
+        c = self.c
+        y = H - MAR_T
+
+        c.setFont("Times-Bold", 14)
+        c.setFillColor(self.INK)
+        c.drawCentredString(W / 2, y, self.empresa)
+        y -= 5 * mm
+        c.setFont("Times-Italic", 9)
+        c.setFillColor(self.MUTED)
+        titulo = "Demonstração do Resultado do Exercício" if self.tipo == "DRE" else "Balanço Patrimonial"
+        c.drawCentredString(W / 2, y, titulo.upper())
+        y -= 4 * mm
+        c.setStrokeColor(self.RULE)
+        c.setLineWidth(0.6)
+        c.line(COL_A, y, COL_C, y)
+        y -= 6 * mm
+
+        col2_x = W / 2 + 4 * mm
+        c.setFont("Helvetica", 8)
+        c.setFillColor(self.MUTED)
+        c.drawString(COL_A, y, "CNPJ")
+        c.drawString(col2_x, y, "Folha / Livro")
+        c.setFillColor(self.INK)
+        c.drawString(COL_A + 12 * mm, y, self.cnpj)
+        c.drawString(col2_x + 24 * mm, y, f"{self.pagina:04d} / {self.numero_livro}")
+        y -= 4.2 * mm
+        c.setFillColor(self.MUTED)
+        c.drawString(COL_A, y, "Período")
+        c.drawString(col2_x, y, "Emissão")
+        c.setFillColor(self.INK)
+        c.drawString(COL_A + 12 * mm, y, f"{self.data_ini} a {self.data_fim}")
+        c.drawString(col2_x + 24 * mm, y, f"{self.cidade}, {self.data_emissao}")
+        y -= 5 * mm
+
+        c.setStrokeColor(self.RULE)
+        c.setLineWidth(0.6)
+        c.line(COL_A, y, COL_C, y)
+        y -= 5 * mm
+
+        c.setFont("Helvetica-Bold", 7.5)
+        c.setFillColor(self.INK)
+        c.drawString(COL_A, y, "Código")
+        c.drawString(COL_A + 22 * mm, y, "Descrição")
+        c.drawRightString(COL_C, y, "Saldo")
+        y -= 1.5 * mm
+        c.setStrokeColor(self.INK)
+        c.setLineWidth(0.5)
+        c.line(COL_A, y, COL_C, y)
+        y -= 4 * mm
+
+        self.y = y
+
+    def _rodape(self, ultima_pagina: bool = False):
+        c = self.c
+        y_rod = MAR_B
+
+        c.setStrokeColor(self.RULE)
+        c.setLineWidth(0.6)
+        c.line(COL_A, y_rod + 12 * mm, COL_C, y_rod + 12 * mm)
+
+        c.setFont("Times-Roman", 8)
+        c.setFillColor(self.MUTED)
+        c.drawString(COL_A, y_rod + 8 * mm, f"{self.cidade}, {self.data_emissao}")
+        c.drawRightString(COL_C, y_rod + 8 * mm, f"Página {self.pagina}")
+
+        if ultima_pagina:
+            cx_e = COL_A + 40 * mm
+            cx_d = COL_C - 40 * mm
+            y_ass = y_rod - 8 * mm
+
+            c.setStrokeColor(self.INK)
+            c.setLineWidth(0.4)
+            c.line(cx_e - 32 * mm, y_ass + 4 * mm, cx_e + 32 * mm, y_ass + 4 * mm)
+            c.line(cx_d - 32 * mm, y_ass + 4 * mm, cx_d + 32 * mm, y_ass + 4 * mm)
+            c.setFont("Times-Bold", 8.5)
+            c.setFillColor(self.INK)
+            c.drawCentredString(cx_e, y_ass, self.empresario_nome or "NOME DO EMPRESÁRIO")
+            c.drawCentredString(cx_d, y_ass, self.contador_nome or "NOME DO CONTADOR")
+            c.setFont("Times-Roman", 7.5)
+            c.setFillColor(self.MUTED)
+            c.drawCentredString(cx_e, y_ass - 4 * mm, self.empresario_cargo)
+            if self.contador_crc:
+                c.drawCentredString(cx_d, y_ass - 4 * mm, f"CRC {self.contador_crc}")
+            if self.empresario_cpf:
+                c.drawCentredString(cx_e, y_ass - 8 * mm, f"CPF {self.empresario_cpf}")
+            if self.contador_cpf:
+                c.drawCentredString(cx_d, y_ass - 8 * mm, f"CPF {self.contador_cpf}")
+
+    def _linha(self, l: Linha, is_last: bool = False):
+        if l.separador or (not l.descricao and l.parcial is None and l.total is None):
+            self.y -= LH_NORM * 0.6
+            return
+
+        self._checar_pagina(LH_NORM + (2 * mm if is_last else 0))
+
+        c = self.c
+        valor = l.total if l.total is not None else l.parcial
+        is_item = l.recuo > 0 and not l.negrito
+        is_section = l.negrito and l.recuo == 0 and valor is None
+        is_subtotal = l.negrito and valor is not None and not is_last
+
+        # Código de plano de contas (sequencial, gerado na hora): "1"/"2" para
+        # Ativo/Passivo (pelo sinal ja aplicado por debit()/credit()), "3" para DRE.
+        codigo = ""
+        if is_item:
+            prefixo = "3"
+            if self.tipo == "BALANCO":
+                prefixo = "2" if (valor is not None and valor < 0) else "1"
+            if prefixo != self._codigo_prefixo_atual:
+                self._codigo_prefixo_atual = prefixo
+                self._sec_num = 0
+            self._item_num += 1
+            codigo = f"{prefixo}.{self._sec_num}.{self._item_num:02d}"
+        elif is_section:
+            self._sec_num += 1
+            self._item_num = 0
+
+        if is_subtotal:
+            c.setStrokeColor(self.INK)
+            c.setLineWidth(0.5)
+            c.line(COL_A, self.y + 2.6 * mm, COL_C, self.y + 2.6 * mm)
+
+        if codigo:
+            c.setFont("Helvetica", 7)
+            c.setFillColor(self.MUTED)
+            c.drawString(COL_A, self.y, codigo)
+
+        desc_x = COL_A + 22 * mm if is_item else COL_A
+        if is_item:
+            desc_x += max(l.recuo - 1, 0) * 4 * mm
+
+        size = SZ_BODY + (0.5 if l.negrito else 0)
+        if is_last:
+            size = 12.5
+        font = "Times-Italic" if is_section else ("Times-Bold" if l.negrito else "Helvetica")
+        c.setFont(font, size)
+        c.setFillColor(self.ACCENT if (is_section or is_last) else self.INK)
+        c.drawString(desc_x, self.y, l.descricao)
+
+        if valor is not None:
+            txt = fmt_dc(valor) if l.sufixo_dc else fmt_br(valor)
+            c.setFont(font, size)
+            cor = self.INK
+            if is_section or is_last:
+                cor = self.ACCENT
+            elif valor < 0 and not l.sufixo_dc:
+                cor = self.ACCENT
+            c.setFillColor(cor)
+            c.drawRightString(COL_C, self.y, txt)
+
+        if is_last:
+            c.setStrokeColor(self.ACCENT)
+            c.setLineWidth(1.1)
+            c.line(COL_A, self.y - 2.2 * mm, COL_C, self.y - 2.2 * mm)
+            c.setLineWidth(0.5)
+            c.line(COL_A, self.y - 3.0 * mm, COL_C, self.y - 3.0 * mm)
+
+        self.y -= LH_NORM if not is_last else LH_NORM + 2 * mm
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MONTAGEM DAS LINHAS — dados puros, independentes do layout escolhido
+# ════════════════════════════════════════════════════════════════════════════
+def montar_linhas_dre(dados: dict) -> List[Linha]:
+    """Constrói a lista de linhas do DRE a partir dos campos extraídos/estimados."""
 
     def L(desc, par=None, tot=None, bold=False, recuo=0):
         return Linha(desc, parcial=par, total=tot, negrito=bold, recuo=recuo)
@@ -614,35 +948,12 @@ def gerar_dre_jacom(dados: dict, output_path: str,
         L("PREJUÍZO DO EXERCÍCIO" if d.get('_resultado_final',0) < 0 else "LUCRO DO EXERCÍCIO",
           tot=d.get('_resultado_final', 0),                                               bold=True),
     ]
-
-    pdf.gerar(linhas)
-    return pdf.salvar()
+    return linhas
 
 
-def gerar_balanco_jacom(dados: dict, output_path: str,
-                        gerencial: bool = True) -> str:
-    """Gera Balanco Patrimonial no padrao JACOM a partir do cenario."""
+def montar_linhas_balanco(dados: dict) -> List[Linha]:
+    """Constrói a lista de linhas do Balanço a partir do cenário calculado."""
     from gerencial.projection_engine import calculate_balanco_totals, normalize_bancos_parceiros
-
-    pdf = JacomPDF(output_path, tipo="BALANCO")
-    pdf.set_empresa(
-        dados.get('empresa', ''),
-        dados.get('cnpj', ''),
-        dados.get('data_ini', ''),
-        dados.get('data_fim', ''),
-        dados.get('cidade', 'SAO PAULO'),
-    )
-    if dados.get('data_emissao'):
-        pdf.set_data_emissao(dados.get('data_emissao'))
-    pdf.set_modo_gerencial(gerencial)
-
-    if dados.get('empresario_nome') or dados.get('contador_nome'):
-        pdf.set_assinaturas(
-            dados['empresario_nome'], dados.get('empresario_cpf', ''),
-            dados.get('contador_nome', ''), dados.get('contador_crc', ''),
-            dados.get('contador_cpf', ''),
-            dados.get('empresario_cargo', 'EMPRESARIO'),
-        )
 
     totals = calculate_balanco_totals(dados)
 
@@ -698,11 +1009,6 @@ def gerar_balanco_jacom(dados: dict, output_path: str,
 
     disponivel_entries = [
         ("CAIXA GERAL", n('caixa_geral')),
-        ("CAIXA ECONOMICA FEDERAL", n('cef')),
-        ("BANCO SICOOB", n('sicoob_mov')),
-        ("BANCO DO BRASIL - APLIC.", n('bb_aplic')),
-        ("BANCO SANTANDER S.A - APLIC.", n('santander_aplic')),
-        ("TITULO DE CAPITALIZACAO", n('titulo_cap')),
     ] + [(banco['nome'].upper(), banco['valor']) for banco in bancos_parceiros]
 
     # The block subtotal prints on the last Disponivel line, whichever it is
@@ -780,9 +1086,126 @@ def gerar_balanco_jacom(dados: dict, output_path: str,
         L("VERIFICACAO: ATIVO - PASSIVO + PL",
           tot=totals['diferenca'], bold=True),
     ]
+    return linhas
 
-    pdf.gerar(linhas)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  FUNÇÕES DE CONVENIÊNCIA — uma por layout, mesma assinatura
+# ════════════════════════════════════════════════════════════════════════════
+def _configurar_documento(pdf: _BaseGerencialPDF, dados: dict, gerencial: bool) -> None:
+    pdf.set_empresa(
+        dados.get('empresa', ''),
+        dados.get('cnpj', ''),
+        dados.get('data_ini', ''),
+        dados.get('data_fim', ''),
+        dados.get('cidade', 'SAO PAULO'),
+    )
+    if dados.get('data_emissao'):
+        pdf.set_data_emissao(dados.get('data_emissao'))
+    pdf.set_modo_gerencial(gerencial)
+    if dados.get('empresario_nome') or dados.get('contador_nome'):
+        pdf.set_assinaturas(
+            dados.get('empresario_nome', ''), dados.get('empresario_cpf', ''),
+            dados.get('contador_nome', ''), dados.get('contador_crc', ''),
+            dados.get('contador_cpf', ''),
+            dados.get('empresario_cargo', 'EMPRESARIO'),
+        )
+
+
+def gerar_dre_jacom(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera DRE no padrão JACOM a partir de um dicionário de valores."""
+    pdf = JacomPDF(output_path, tipo="DRE")
+    _configurar_documento(pdf, dados, gerencial)
+    pdf.gerar(montar_linhas_dre(dados))
     return pdf.salvar()
+
+
+def gerar_balanco_jacom(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera Balanco Patrimonial no padrao JACOM a partir do cenario."""
+    pdf = JacomPDF(output_path, tipo="BALANCO")
+    _configurar_documento(pdf, dados, gerencial)
+    pdf.gerar(montar_linhas_balanco(dados))
+    return pdf.salvar()
+
+
+def gerar_dre_moderno(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera DRE no layout "Extrato Gerencial" (moderno)."""
+    from gerencial.projection_engine import calculate_dre_totals
+
+    pdf = ModernoPDF(output_path, tipo="DRE")
+    _configurar_documento(pdf, dados, gerencial)
+
+    totals = calculate_dre_totals(dados)
+    pdf.set_base_pct(totals['receita_bruta'])
+    resultado = dados.get('_resultado_final', totals['resultado_exercicio'])
+    pdf.set_kpis([
+        ("Receita Bruta", fmt_br(totals['receita_bruta'], parenteses=False), "neutral"),
+        ("Resultado do Exercício", fmt_br(resultado), "neg" if resultado < 0 else "accent"),
+        ("Margem Líquida", f"{totals['margem_liquida'] * 100:.1f}%", "neg" if resultado < 0 else "accent"),
+    ])
+
+    pdf.gerar(montar_linhas_dre(dados))
+    return pdf.salvar()
+
+
+def gerar_balanco_moderno(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera Balanço no layout "Extrato Gerencial" (moderno)."""
+    from gerencial.projection_engine import calculate_balanco_totals
+
+    pdf = ModernoPDF(output_path, tipo="BALANCO")
+    _configurar_documento(pdf, dados, gerencial)
+
+    totals = calculate_balanco_totals(dados)
+    pdf.set_base_pct(totals['ativo_total'])
+    diff = totals['diferenca']
+    pdf.set_kpis([
+        ("Ativo Total", fmt_br(totals['ativo_total'], parenteses=False), "neutral"),
+        ("Patrimônio Líquido", fmt_br(totals['patrimonio_liquido'], parenteses=False), "accent"),
+        ("Verificação (A - P+PL)", fmt_br(diff), "neutral" if abs(diff) < 0.01 else "neg"),
+    ])
+
+    pdf.gerar(montar_linhas_balanco(dados))
+    return pdf.salvar()
+
+
+def gerar_dre_formal(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera DRE no layout "Relatório Patrimonial" (formal)."""
+    pdf = FormalPDF(output_path, tipo="DRE")
+    _configurar_documento(pdf, dados, gerencial)
+    pdf.gerar(montar_linhas_dre(dados))
+    return pdf.salvar()
+
+
+def gerar_balanco_formal(dados: dict, output_path: str, gerencial: bool = True) -> str:
+    """Gera Balanço no layout "Relatório Patrimonial" (formal)."""
+    pdf = FormalPDF(output_path, tipo="BALANCO")
+    _configurar_documento(pdf, dados, gerencial)
+    pdf.gerar(montar_linhas_balanco(dados))
+    return pdf.salvar()
+
+
+_DRE_GENERATORS = {
+    "jacom": gerar_dre_jacom,
+    "moderno": gerar_dre_moderno,
+    "formal": gerar_dre_formal,
+}
+_BALANCO_GENERATORS = {
+    "jacom": gerar_balanco_jacom,
+    "moderno": gerar_balanco_moderno,
+    "formal": gerar_balanco_formal,
+}
+
+
+def gerar_dre(dados: dict, output_path: str, layout: str = "jacom", gerencial: bool = True) -> str:
+    """Gera o DRE no layout escolhido ("jacom", "moderno" ou "formal")."""
+    fn = _DRE_GENERATORS.get(layout, gerar_dre_jacom)
+    return fn(dados, output_path, gerencial=gerencial)
+
+
+def gerar_balanco(dados: dict, output_path: str, layout: str = "jacom", gerencial: bool = True) -> str:
+    """Gera o Balanço no layout escolhido ("jacom", "moderno" ou "formal")."""
+    fn = _BALANCO_GENERATORS.get(layout, gerar_balanco_jacom)
+    return fn(dados, output_path, gerencial=gerencial)
 
 
 # ── Demo ─────────────────────────────────────────────────────────────────────

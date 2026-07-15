@@ -142,11 +142,6 @@ DRE_VALUE_FIELDS = (
 
 BAL_DISPONIVEL_FIELDS = [
     "caixa_geral",
-    "cef",
-    "sicoob_mov",
-    "bb_aplic",
-    "santander_aplic",
-    "titulo_cap",
 ]
 
 BAL_CLIENTES_FIELDS = ["clientes"]
@@ -159,8 +154,6 @@ BAL_ESTOQUE_FIELDS = ["merc_revenda", "prod_acabados"]
 
 BAL_ATIVO_NAO_CIRC_FIELDS = [
     "emp_socios",
-    "gran_belle",
-    "solution_vet",
     "quotas_sicoob",
     "banco_sicoob_inv",
     "instalacoes",
@@ -168,6 +161,18 @@ BAL_ATIVO_NAO_CIRC_FIELDS = [
     "maquinas",
     "equip_ti",
     "veiculos",
+]
+
+# "gran_belle"/"solution_vet" are the analytic breakdown of "emp_compulsorios":
+# when the analytic figures are reported, the synthetic total is a duplicate
+# and must be ignored (see README_GERENCIAL.md), so totals use whichever one
+# is actually populated instead of the analytic fields alone.
+BAL_COMPULSORIOS_ANALITICOS_FIELDS = ["gran_belle", "solution_vet"]
+
+# The extractor returns depreciation as a positive magnitude (see module
+# docstring); it's a contra-asset, so totals must subtract it rather than
+# fold it into BAL_ATIVO_NAO_CIRC_FIELDS as a positive addition.
+BAL_DEPRECIACAO_FIELDS = [
     "dep_moveis",
     "dep_maquinas",
     "dep_veiculos",
@@ -238,6 +243,8 @@ BAL_VALUE_FIELDS = (
     + BAL_OUTROS_CREDITOS_DED_FIELDS
     + BAL_ESTOQUE_FIELDS
     + BAL_ATIVO_NAO_CIRC_FIELDS
+    + BAL_COMPULSORIOS_ANALITICOS_FIELDS
+    + BAL_DEPRECIACAO_FIELDS
     + BAL_COMPENSACAO_ATIVO_FIELDS
     + BAL_PASSIVO_CP_MANTIDO_FIELDS
     + BAL_FORNECEDORES_FIELDS
@@ -360,10 +367,6 @@ def normalize_dre(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 def normalize_balanco(raw: Mapping[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {field: _number(raw.get(field, 0.0)) for field in BAL_VALUE_FIELDS}
-
-    # The current extractor does not read a total fornecedores line; the
-    # validated workbook uses this fixed value until the extraction is expanded.
-    out["fornecedores_total"] = _number(raw.get("fornecedores_total", 1_408_890.43))
 
     # Bancos parceiros are company-specific and can't be benchmarked or
     # extracted generically, so they are entered by hand: a free-form list of
@@ -541,10 +544,6 @@ def project_balanco(
         - original_dre_totals.get("resultado_exercicio", 0.0)
     )
 
-    disponivel_target = _sum(original, BAL_DISPONIVEL_FIELDS) + delta_resultado
-    for field, value in _allocate(original, BAL_DISPONIVEL_FIELDS, disponivel_target, fallback="caixa_geral").items():
-        scenario[field] = value
-
     for field in BAL_CLIENTES_FIELDS:
         scenario[field] = _number(original.get(field, 0.0)) * rb_factor
 
@@ -554,9 +553,39 @@ def project_balanco(
     for field in BAL_OUTROS_CREDITOS_DESP_FIELDS + BAL_PASSIVO_DESP_FIELDS:
         scenario[field] = _number(original.get(field, 0.0)) * (1 - params.reducao_despesas_pct)
 
-    ded_factor = _safe_div(params.aliquota_deducoes_pct, 0.35)
+    # Scale by how much the chosen aliquota diverges from the company's own
+    # original rate (not a fixed reference value), so a scenario that keeps
+    # the real aliquota leaves these liabilities/credits unchanged.
+    original_aliquota_deducoes = _safe_div(
+        original_dre_totals.get("deducoes", 0.0), original_rb
+    )
+    ded_factor = _safe_div(
+        params.aliquota_deducoes_pct, original_aliquota_deducoes, default=1.0
+    )
     for field in BAL_OUTROS_CREDITOS_DED_FIELDS + BAL_PASSIVO_DED_FIELDS:
         scenario[field] = _number(original.get(field, 0.0)) * ded_factor
+
+    # Cash absorbs the profit change plus every working-capital swing caused
+    # by the reallocations above, so Ativo Total keeps matching Passivo + PL:
+    # an asset increase consumes cash, a liability increase frees it up.
+    asset_wc_fields = (
+        BAL_CLIENTES_FIELDS
+        + BAL_OUTROS_CREDITOS_CMV_FIELDS
+        + BAL_ESTOQUE_FIELDS
+        + BAL_OUTROS_CREDITOS_DESP_FIELDS
+        + BAL_OUTROS_CREDITOS_DED_FIELDS
+    )
+    liability_wc_fields = BAL_FORNECEDORES_FIELDS + BAL_PASSIVO_DESP_FIELDS + BAL_PASSIVO_DED_FIELDS
+
+    cash_effect = delta_resultado
+    for field in asset_wc_fields:
+        cash_effect -= scenario[field] - _number(original.get(field, 0.0))
+    for field in liability_wc_fields:
+        cash_effect += scenario[field] - _number(original.get(field, 0.0))
+
+    disponivel_target = _sum(original, BAL_DISPONIVEL_FIELDS) + cash_effect
+    for field, value in _allocate(original, BAL_DISPONIVEL_FIELDS, disponivel_target, fallback="caixa_geral").items():
+        scenario[field] = value
 
     # Patrimonio liquido absorbs the result change, following the workbook.
     scenario["prej_acum"] = (
@@ -579,7 +608,14 @@ def calculate_balanco_totals(values: Mapping[str, Any]) -> dict[str, float]:
     )
     estoque = _sum(values, BAL_ESTOQUE_FIELDS)
     ativo_circulante = disponivel + clientes + outros_creditos + estoque
-    ativo_nao_circulante = _sum(values, BAL_ATIVO_NAO_CIRC_FIELDS)
+    compulsorios_analiticos = _sum(values, BAL_COMPULSORIOS_ANALITICOS_FIELDS)
+    compulsorios = (
+        compulsorios_analiticos
+        if abs(compulsorios_analiticos) > 1e-9
+        else _number(values.get("emp_compulsorios", 0.0))
+    )
+    depreciacao = _sum(values, BAL_DEPRECIACAO_FIELDS)
+    ativo_nao_circulante = _sum(values, BAL_ATIVO_NAO_CIRC_FIELDS) + compulsorios - depreciacao
     compensacao_ativo = _sum(values, BAL_COMPENSACAO_ATIVO_FIELDS)
     ativo_total = ativo_circulante + ativo_nao_circulante + compensacao_ativo
 
