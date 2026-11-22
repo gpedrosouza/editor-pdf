@@ -47,3 +47,8 @@ gerencial/data/
 # Local backup archives (not project source)
 *.rar
 *.zip
+
+# Documentos financeiros de clientes — só na máquina local
+documentos/*.pdf
+DRE_LAYOUT_JACOM.pdf
+FERRAMENTA_PROJECAO_GERENCIAL.xlsx
